@@ -103,7 +103,7 @@ def run_setup_ui(console, install, base):
                 done.add(cur[0])
             cur[0], view["frac"], view["dl"], view["t0"] = step, None, "", time.time()
         if frac is not None and step not in ("gpu",):
-            view["frac"] = frac if step in ("uv", "index_tts", "ffmpeg", "model") else view["frac"]
+            view["frac"] = frac if step in ("uv", "index_tts", "ffmpeg", "model", "extras") else view["frac"]
         if msg:
             view["line"] = msg
         redraw()
@@ -142,6 +142,8 @@ def run_setup_ui(console, install, base):
 
 
 def ensure_setup(console, install):
+    if setup.is_set_up(install) and not setup.extras_cached(install):
+        setup.forget_extras(install)             # setup says done but the cache lost the files: fetch them once, with a bar
     if setup.is_set_up(install):
         return True
     err = run_setup_ui(console, install, os.environ)
@@ -174,7 +176,7 @@ class Collector:
         self._stop = True
 
 
-def board_state(install, queue, gpu, state, started, now=None, events=None, workers=1):
+def board_state(install, queue, gpu, state, started, now=None, events=None, workers=1, net=None):
     now = now or time.time()
     if events is not None:
         s = stats.summarize(events, now)
@@ -182,6 +184,7 @@ def board_state(install, queue, gpu, state, started, now=None, events=None, work
         dirs = [install / "work" / "logs"] + ([install / "work_2" / "logs"] if workers == 2 else [])
         s = stats.merge_summaries([stats.summarize(stats.read_events(d), now) for d in dirs])
     s["workers"] = workers
+    s["net"] = net.figures(s.get("job")) if net else None
     s["queue"], s["gpu"], s["state"] = queue, gpu, state
     s["time_left"] = stats.time_left(queue, s["words_hour"], s["lines_hour"])
     s["since_label"] = time.strftime("%H:%M", time.localtime(s["first_today"] or started))
@@ -218,12 +221,12 @@ def start_now(console, install, settings):
     try:
         with KeyReader() as keys, Live(console=console, screen=VT["on"], auto_refresh=False) as live:
             last_gpu, gpu, last_draw, last_view, last_size = 0, None, 0, None, console.size
-            monitor = stats.GpuMonitor()
+            monitor, net = stats.GpuMonitor(), stats.NetMeter()
             while True:
                 if time.time() - last_gpu > 2:
                     gpu, last_gpu = monitor.read(), time.time()
                 state = "paused" if paused else ("stopped" if not runner.running else "idle")
-                view = board_state(install, col.queue, gpu, state, started, workers=runner.count)
+                view = board_state(install, col.queue, gpu, state, started, workers=runner.count, net=net)
                 # Redraw only every 5 s or when something changed: a 4/s full-screen redraw flickered (owner 2026-11-11).
                 resized = console.size != last_size
                 if resized or (view != last_view and time.time() - last_draw >= 2) or time.time() - last_draw >= 5:
@@ -353,6 +356,12 @@ def background_tick(runner, st, now=None, readers=None):
 
 def background(install, st):
     hide_console()
+    if setup.is_set_up(install) and not setup.extras_cached(install):
+        setup.forget_extras(install)
+        try:
+            setup.run_setup(setup.Env(install, paths.resource_dir(), run=setup.real_run), only=("extras",))
+        except setup.SetupError:
+            return 2
     if not setup.is_set_up(install):
         return 2
     runner = WorkerGroup(install, st["workers"])

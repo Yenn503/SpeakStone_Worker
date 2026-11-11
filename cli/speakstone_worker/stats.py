@@ -280,3 +280,64 @@ class GpuMonitor:
         if d3 is not None:
             g["util3d_pct"] = round(d3)
         return g
+
+
+# ---------------------------------------------------------------- bytes received (so a download storm is visible)
+def parse_netstat_in(text):
+    """`netstat -e` -> bytes received, whatever the language: the first line that is a label followed by two numbers."""
+    for ln in text.splitlines():
+        parts = ln.split()
+        nums = [p for p in parts[1:] if p.isdigit()]
+        if len(parts) == 3 and not parts[0].isdigit() and len(nums) == 2:
+            return int(nums[0])
+    return None
+
+
+def read_net_in(runner=subprocess.run):
+    """Bytes received by this PC (all adapters). A machine-wide figure: Windows has no cheap per-process network counter."""
+    try:
+        if sys.platform == "win32":
+            r = runner(["netstat", "-e"], capture_output=True, text=True, timeout=5, creationflags=0x08000000)
+            return parse_netstat_in(r.stdout)
+        total = 0
+        with open("/proc/net/dev", encoding="utf-8") as f:
+            for ln in list(f)[2:]:
+                name, _, rest = ln.partition(":")
+                if name.strip() != "lo":
+                    total += int(rest.split()[0])
+        return total
+    except Exception:
+        return None
+
+
+class NetMeter:
+    """MB received this job and this session. The job figure restarts when the job id changes."""
+
+    def __init__(self, reader=None, start_thread=True):
+        self.reader = reader or read_net_in
+        self.start = self.job_base = self.last = None
+        self.job = None
+        if start_thread:
+            threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            self.sample()
+            time.sleep(3)
+
+    def sample(self):
+        v = self.reader()
+        if v is not None:
+            self.last = v
+            if self.start is None:
+                self.start = v
+            if self.job_base is None:
+                self.job_base = v
+
+    def figures(self, job):
+        """(job_mb, session_mb) or None before the first reading."""
+        if self.last is None:
+            return None
+        if job != self.job:
+            self.job, self.job_base = job, self.last
+        return ((self.last - self.job_base) / 1e6, (self.last - self.start) / 1e6)

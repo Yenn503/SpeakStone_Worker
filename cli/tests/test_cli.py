@@ -712,3 +712,77 @@ def test_fresh_screen_does_a_hard_cls_on_windows(monkeypatch):
     monkeypatch.setattr(cli, "drain", lambda: None)
     cli.fresh_screen(Console(file=io.StringIO(), width=80, height=24))
     assert ran == [["cmd", "/c", "cls"]]
+
+
+# ------------------------------------------------------------------ no per-job downloads
+def fake_hf_cache(install, complete=True):
+    hub = Path(install) / "hf" / "hub"
+    spec = {"models--facebook--w2v-bert-2.0": ["config.json", "preprocessor_config.json", "model.safetensors"],
+            "models--nvidia--bigvgan_v2_22khz_80band_256x": ["config.json", "bigvgan_generator.pt"],
+            "models--amphion--MaskGCT": ["semantic_codec/model.safetensors"],
+            "models--funasr--campplus": ["campplus_cn_common.bin"]}
+    for i, (repo, files) in enumerate(spec.items()):
+        for f in files[: (len(files) if complete or i else 0)]:
+            p = hub / repo / "snapshots" / "abc" / f
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("x")
+
+
+def test_extras_cached_and_offline_env(tmp_path):
+    from speakstone_worker.runner import WorkerRunner
+    e = WorkerRunner(tmp_path).environment({"HF_HUB_OFFLINE": "1"})
+    assert setup.extras_cached(tmp_path) is False and "HF_HUB_OFFLINE" not in e      # cache empty: must be allowed to fetch
+    fake_hf_cache(tmp_path)
+    assert setup.extras_cached(tmp_path) is True
+    e = WorkerRunner(tmp_path).environment({})
+    assert e["HF_HOME"] == str(tmp_path / "hf") and e["HF_HUB_OFFLINE"] == "1" and e["TRANSFORMERS_OFFLINE"] == "1"
+    # both workers get the same cache and the same model folder
+    assert WorkerRunner(tmp_path, index=2).environment({})["HF_HOME"] == e["HF_HOME"]
+    assert WorkerRunner(tmp_path, index=2).environment({})["INDEXTTS2_DIR"] == e["INDEXTTS2_DIR"]
+
+
+def test_partial_cache_is_not_cached(tmp_path):
+    fake_hf_cache(tmp_path, complete=False)
+    assert setup.extras_cached(tmp_path) is False
+
+
+def test_synth_env_keeps_hf_home_and_offline():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    import net_worker
+    cfg = net_worker.Config()
+    cfg.model_dir, cfg.worker_key = "M", ""
+    w = net_worker.Worker.__new__(net_worker.Worker)
+    w.cfg = cfg
+    old = {k: os.environ.get(k) for k in ("HF_HOME", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")}
+    os.environ.update(HF_HOME="C:/inst/hf", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+    try:
+        env = w.synth_env()
+    finally:
+        for k, v in old.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    assert env["HF_HOME"] == "C:/inst/hf" and env["HF_HUB_OFFLINE"] == "1" and env["TRANSFORMERS_OFFLINE"] == "1"
+
+
+def test_forget_extras_then_setup_state(tmp_path):
+    (tmp_path / "setup_state.json").write_text(json.dumps({"done": ["model", "extras"]}))
+    setup.forget_extras(tmp_path)
+    assert json.loads((tmp_path / "setup_state.json").read_text())["done"] == ["model"]
+
+
+def test_parse_netstat_and_net_meter():
+    txt = ("Interface Statistics\n\n                           Received            Sent\n\n"
+           "Bytes                 123456789        98765432\nUnicast packets          1000            900\n")
+    assert stats.parse_netstat_in(txt) == 123456789
+    assert stats.parse_netstat_in("Bytes empfangen") is None
+    seq = iter([1_000_000, 3_000_000, 9_000_000])
+    m = stats.NetMeter(reader=lambda: next(seq), start_thread=False)
+    assert m.figures("j") is None
+    m.sample()
+    assert m.figures("j1") == (0.0, 0.0)
+    m.sample()
+    assert m.figures("j1") == (2.0, 2.0)
+    m.sample()
+    assert m.figures("j2") == (0.0, 8.0)                       # new job restarts the job figure only
+    s = sample_state()
+    s["net"] = (1.5, 8.0)
+    assert "Download: 2 MB this job / 8 MB session" in plain(board.render_board(s), width=120)

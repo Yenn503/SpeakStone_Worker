@@ -448,3 +448,28 @@ def run_setup(env, only=None):
         ran.append(name)
     env.progress("done", 1.0, "Setup finished.")
     return ran
+
+
+def extras_cached(install):
+    """True when every file the engine would fetch on its first job is already in <install>/hf. Pure file check."""
+    hub = Path(install) / "hf" / "hub"
+    need = {"models--facebook--w2v-bert-2.0": ["config.json", "preprocessor_config.json", "model.safetensors"],
+            "models--nvidia--bigvgan_v2_22khz_80band_256x": ["config.json", "bigvgan_generator.pt"],
+            "models--amphion--MaskGCT": ["semantic_codec/model.safetensors"],
+            "models--funasr--campplus": ["campplus_cn_common.bin"]}
+    for repo, files in need.items():
+        snaps = list((hub / repo / "snapshots").glob("*"))
+        if not any(all((sn / f).exists() for f in files) for sn in snaps):
+            return False
+    return True
+
+
+def forget_extras(install):
+    """Mark the prefetch step as not done (the cache lost it), so the next setup run fetches it again."""
+    f = Path(install) / "setup_state.json"
+    try:
+        done = set(json.loads(f.read_text(encoding="utf-8")).get("done", []))
+    except (OSError, ValueError):
+        return
+    done.discard("extras")
+    f.write_text(json.dumps({"done": sorted(done)}), encoding="utf-8")

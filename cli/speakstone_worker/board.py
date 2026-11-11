@@ -175,6 +175,8 @@ def render_board(s):
     foot.append("stop and exit", style=DIM)
     foot.append("   [M] ", style=GOLD)
     foot.append("menu", style=DIM)
+    if s.get("net"):
+        foot.append(f"   Download: {s['net'][0]:,.0f} MB this job / {s['net'][1]:,.0f} MB session", style=DIM)
 
     root = Layout(name="root")
     root.split_column(top, mid, Layout(_panel(now, "NOW MAKING"), name="now", size=3),
