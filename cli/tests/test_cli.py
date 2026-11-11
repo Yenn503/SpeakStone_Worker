@@ -677,4 +677,38 @@ def test_drain_empties_pending_keys_on_windows(monkeypatch):
 
 def test_live_boards_use_the_alternate_screen():
     src = (Path(__file__).resolve().parents[1] / "speakstone_worker" / "cli.py").read_text(encoding="utf-8")
-    assert src.count("screen=True") == 2            # live board and setup board
+    assert src.count('screen=VT["on"]') == 2        # live board and setup board, only when ANSI works
+
+
+class _K32:
+    def __init__(self, set_ok=True):
+        self.modes, self.set_ok = {}, set_ok
+
+    def GetStdHandle(self, n):
+        return n
+
+    def GetConsoleMode(self, h, ref):
+        ref._obj.value = 0x0003
+        return 1
+
+    def SetConsoleMode(self, h, m):
+        self.modes[h] = m
+        return 1 if self.set_ok else 0
+
+
+def test_enable_vt_sets_output_and_input_flags():
+    from speakstone_worker import cli
+    k = _K32()
+    assert cli.enable_vt(k) is True
+    assert k.modes[-11] == 0x0003 | 0x0004 and k.modes[-10] == 0x0003 | 0x0200
+    assert cli.enable_vt(_K32(set_ok=False)) is False
+
+
+def test_fresh_screen_does_a_hard_cls_on_windows(monkeypatch):
+    from speakstone_worker import cli
+    ran = []
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.setattr(cli.subprocess, "run", lambda c, **k: ran.append(c))
+    monkeypatch.setattr(cli, "drain", lambda: None)
+    cli.fresh_screen(Console(file=io.StringIO(), width=80, height=24))
+    assert ran == [["cmd", "/c", "cls"]]

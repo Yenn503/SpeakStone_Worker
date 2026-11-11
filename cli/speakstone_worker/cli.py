@@ -5,6 +5,7 @@ import os
 import platform
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -18,9 +19,41 @@ from .runner import WorkerGroup, install_close_handlers
 from .settings import Settings, in_pause_window, parse_hhmm
 
 
+VT = {"on": True}                           # False when the console cannot do ANSI: no alternate screen then
+
+
+def enable_vt(kernel32=None):
+    """Windows: switch on ANSI escape handling for the console's output (and input). Classic conhost starts with it
+    off, so clears and the alternate screen are silently ignored. True when output VT is on (always True elsewhere)."""
+    if sys.platform != "win32" and kernel32 is None:
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = kernel32 or ctypes.windll.kernel32
+        ok_out = False
+        for std, flag in ((-11, 0x0004), (-10, 0x0200)):        # stdout: VT processing; stdin: VT input
+            h = k.GetStdHandle(std)
+            mode = wintypes.DWORD()
+            if not h or not k.GetConsoleMode(h, ctypes.byref(mode)):
+                continue
+            ok = bool(k.SetConsoleMode(h, mode.value | flag))
+            if std == -11:
+                ok_out = ok
+        return ok_out
+    except Exception:
+        return False
+
+
 def fresh_screen(console):
-    """Start a screen from nothing: cursor back, stale keys dropped, old text wiped."""
+    """Start a screen from nothing: stale keys dropped, a hard clear (cls on Windows, works with or without ANSI),
+    then rich's own clear and the cursor back."""
     drain()
+    if sys.platform == "win32":
+        try:
+            subprocess.run(["cmd", "/c", "cls"], check=False)  # fixed argument list, no user input
+        except Exception:
+            pass
     try:
         console.show_cursor(True)
     except Exception:
@@ -29,6 +62,7 @@ def fresh_screen(console):
 
 
 def make_console():
+    VT["on"] = enable_vt()                           # before the Console is made, so rich sees ANSI is available
     for stream in (sys.stdout, sys.stderr):          # piped/cp1252 consoles would choke on the block letters
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -56,7 +90,7 @@ def worker_label(install):
 def run_setup_ui(console, install, base):
     steps, done, cur = list(setup.STEPS), set(setup.load_state(setup.Env(install, paths.resource_dir()))), [None]
     view = {"frac": None, "line": "", "dl": "", "t0": time.time()}
-    live = Live(console=console, refresh_per_second=4, screen=True)     # alternate screen: nothing is left behind the menu
+    live = Live(console=console, refresh_per_second=4, screen=VT["on"])     # alternate screen: nothing is left behind the menu
 
     def redraw(error=None):
         live.update(board.render_setup(steps, setup.LABELS, done, cur[0], view["frac"], view["line"], view["dl"], error))
@@ -182,7 +216,7 @@ def start_now(console, install, settings):
         runner.start()
     result = "menu"
     try:
-        with KeyReader() as keys, Live(console=console, screen=True, auto_refresh=False) as live:
+        with KeyReader() as keys, Live(console=console, screen=VT["on"], auto_refresh=False) as live:
             last_gpu, gpu, last_draw, last_view, last_size = 0, None, 0, None, console.size
             monitor = stats.GpuMonitor()
             while True:
