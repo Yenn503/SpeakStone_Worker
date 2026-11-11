@@ -199,6 +199,7 @@ def start_now(console, install, settings):
     if not ensure_setup(console, install):
         return "menu"
     fresh_screen(console)
+    setup.sync_worker_files(install, paths.resource_dir())
     runner = WorkerGroup(install, settings["workers"])
     old = runner.find_existing()
     if old:
@@ -364,6 +365,7 @@ def background(install, st):
             return 2
     if not setup.is_set_up(install):
         return 2
+    setup.sync_worker_files(install, paths.resource_dir())
     runner = WorkerGroup(install, st["workers"])
     install_close_handlers(runner.shutdown_fast)
     try:

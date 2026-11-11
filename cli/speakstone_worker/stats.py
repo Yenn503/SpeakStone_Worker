@@ -105,6 +105,10 @@ def summarize(events, now, avg_job_seconds_default=60.0):
                 if ev == "resume":
                     out["events"].append((ts, "retry", f"job {job[:8]}", "picked up again"))
             out["making"] = True
+        elif ev == "run_end" and kv.get("error"):
+            out["events"].append((ts, "error", f"job {job[:8]} - {kv['error'][:90]}", ""))
+        elif ev == "offline_retry":
+            out["events"].append((ts, "retry", f"job {job[:8]} - fetching a missing file", kv.get("error", "")[:60]))
         elif ev == "fail":
             out["making"] = False
             out["events"].append((ts, "retry", f"job {job[:8]} - given back", kv.get("reason", "")))

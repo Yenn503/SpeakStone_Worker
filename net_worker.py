@@ -59,6 +59,10 @@ HELD_DIR = "_held_qc"
 QC_LOG = "_qc_held.jsonl"
 PROV_LOG = "generation_provenance.jsonl"
 GPU_UNSAFE_MARKER = "GPU state is unsafe"
+# A first-load model file that is not in the offline cache. The run is repeated ONCE with offline mode off.
+OFFLINE_MISS = re.compile(r"LocalEntryNotFoundError|offline mode|Cannot find the requested files|HF_HUB_OFFLINE|"
+                          r"outgoing traffic has been disabled|couldn't connect to 'https://huggingface", re.I)
+OFFLINE_ENV = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
 KEY_RE = re.compile(r"^sswk_[A-Za-z0-9_-]{43}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 BITRATE_RE = re.compile(r"^[0-9]{2,3}k$")
@@ -1236,6 +1240,8 @@ class Worker:
         t_run = time.time()
         runs = 0
         last_err = ""
+        self.force_online = False
+        online_retry_done = False
         while True:
             runs += 1
             self.log.event("run_start", ctx.job_id, run=runs, lines=ctx.n)
@@ -1248,6 +1254,12 @@ class Worker:
             if err:
                 last_err = err
             extra = {"error": err} if err else {}
+            if (rc and not online_retry_done and os.environ.get("HF_HUB_OFFLINE")
+                    and OFFLINE_MISS.search(self.log_tail(log_path, offset))):
+                online_retry_done = self.force_online = True
+                self.note_offline_miss(err)
+                self.log.event("offline_retry", ctx.job_id, run=runs, error=err or "offline cache miss")
+                continue
             self.log.event("run_end", ctx.job_id, run=runs, exit=rc,
                            ok=sum(1 for v in st.values() if v["kind"] == "ok"),
                            held=sum(1 for v in st.values() if v["kind"] == "held"),
@@ -1345,6 +1357,9 @@ class Worker:
         # some cloud images turn hf_transfer on without installing it, which crashes
         # IndexTTS-2's first-load model fetch on every run. Plain downloads work everywhere.
         env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+        if getattr(self, "force_online", False):
+            for k in OFFLINE_ENV:                # the one retry that is allowed to fetch what the cache lacked
+                env.pop(k, None)
         for k in ("IDX2_NUM_BEAMS", "IDX2_BEAMS_BY_EMOTION", "SSW_WORKER_KEY", "WORKER_KEY", "SSW_VERCEL_BYPASS"):
             env.pop(k, None)
         key = self.cfg.worker_key
@@ -1381,6 +1396,24 @@ class Worker:
                 return needle in f.read().decode("utf-8", "replace")
         except OSError:
             return False
+
+    @staticmethod
+    def log_tail(path, offset, max_bytes=65536):
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(offset, f.tell() - max_bytes))
+                return f.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def note_offline_miss(self, err):
+        """Remember what the offline cache lacked (the error line names the file), so setup can add it."""
+        try:
+            with open(self.work / "offline_misses.txt", "a", encoding="utf-8") as f:
+                f.write(f"{utc_iso()} {err or 'offline cache miss'}\n")
+        except OSError:
+            pass
 
     # ---- what the subprocess made (8.3 step 9)
     def scan(self, ctx):

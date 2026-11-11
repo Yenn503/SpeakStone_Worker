@@ -473,3 +473,22 @@ def forget_extras(install):
         return
     done.discard("extras")
     f.write_text(json.dumps({"done": sorted(done)}), encoding="utf-8")
+
+
+def sync_worker_files(env_or_install, resource_dir=None):
+    """Copy the bundled worker scripts over the installed ones when they differ. Setup copies them once; without this
+    an install made by an older app keeps running the older worker (no error text in failures, no fixes)."""
+    install = Path(getattr(env_or_install, "install", env_or_install))
+    res = Path(getattr(env_or_install, "resource_dir", resource_dir))
+    changed = []
+    for n in WORKER_FILES:
+        src, dst = res / n, install / n
+        if not src.exists():
+            continue
+        try:
+            if not dst.exists() or dst.read_bytes() != src.read_bytes():
+                shutil.copy2(src, dst)
+                changed.append(n)
+        except OSError:
+            pass
+    return changed

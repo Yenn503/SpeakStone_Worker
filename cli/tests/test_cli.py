@@ -786,3 +786,59 @@ def test_parse_netstat_and_net_meter():
     s = sample_state()
     s["net"] = (1.5, 8.0)
     assert "Download: 2 MB this job / 8 MB session" in plain(board.render_board(s), width=120)
+
+
+# ------------------------------------------------------------------ self-heal and visibility
+def _worker_obj():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    import net_worker
+    cfg = net_worker.Config()
+    cfg.model_dir, cfg.worker_key = "M", ""
+    w = net_worker.Worker.__new__(net_worker.Worker)
+    w.cfg = cfg
+    return net_worker, w
+
+
+def test_offline_miss_patterns_and_online_retry_env(tmp_path, monkeypatch):
+    nw, w = _worker_obj()
+    for text in ("huggingface_hub.errors.LocalEntryNotFoundError: Cannot find an appropriate cached snapshot folder",
+                 "OSError: We couldn't connect to 'https://huggingface.co' to load this file",
+                 "Cannot find the requested files in the disk cache and outgoing traffic has been disabled",
+                 "Offline mode is enabled"):
+        assert nw.OFFLINE_MISS.search(text), text
+    assert not nw.OFFLINE_MISS.search("CUDA out of memory")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    w.force_online = False
+    assert w.synth_env()["HF_HUB_OFFLINE"] == "1"
+    w.force_online = True
+    e = w.synth_env()
+    assert "HF_HUB_OFFLINE" not in e and "TRANSFORMERS_OFFLINE" not in e
+    w.work = tmp_path
+    w.note_offline_miss("LocalEntryNotFoundError: campplus_cn_common.bin")
+    assert "campplus_cn_common.bin" in (tmp_path / "offline_misses.txt").read_text()
+    log = tmp_path / "worker.log"
+    log.write_bytes(b"old\nnew LocalEntryNotFoundError here")
+    assert "LocalEntryNotFoundError" in w.log_tail(log, 4) and "old" not in w.log_tail(log, 4)
+
+
+def test_sync_worker_files_replaces_stale_install_copy(tmp_path):
+    res, inst = tmp_path / "res", tmp_path / "inst"
+    res.mkdir()
+    inst.mkdir()
+    for n in setup.WORKER_FILES:
+        (res / n).write_text("new " + n)
+    (inst / "net_worker.py").write_text("old")
+    assert sorted(setup.sync_worker_files(inst, res)) == sorted(setup.WORKER_FILES)
+    assert (inst / "net_worker.py").read_text() == "new net_worker.py"
+    assert setup.sync_worker_files(inst, res) == []                        # nothing to do the second time
+
+
+def test_run_end_error_shows_in_recent_events():
+    now = time.time()
+    ev = [(now - 5, "claim", {"job": "abcdef123456", "lines": "3"}),
+          (now - 3, "run_end", {"job": "abcdef123456", "exit": "1", "error": "OSError: campplus_cn_common.bin missing"}),
+          (now - 2, "offline_retry", {"job": "abcdef123456", "error": "LocalEntryNotFoundError"})]
+    s = stats.summarize(ev, now)
+    texts = " ".join(e[2] + " " + e[3] for e in s["events"])
+    assert "OSError: campplus_cn_common.bin missing" in texts and "fetching a missing file" in texts
