@@ -28,7 +28,13 @@ python net_worker.py init --model-dir D:\models\IndexTTS-2
 user-only permissions. Optional: `--machine-name`, `--work-dir`, `--api-base`.
 
 Settings can also come from environment variables, which override the file: `SSW_WORKER_KEY`, `SSW_API_BASE`,
-`SSW_WORK_DIR`, `SSW_MACHINE_NAME`, `INDEXTTS2_DIR`, `INDEXTTS2_PYTHON`, `SSW_NEED_FREE_MIB`.
+`SSW_WORK_DIR`, `SSW_MACHINE_NAME`, `INDEXTTS2_DIR`, `INDEXTTS2_PYTHON`, `SSW_NEED_FREE_MIB`, `SSW_YIELD_LOCK`.
+
+## Sharing the GPU with another program
+
+If something else on your PC uses the GPU and marks it with a lock file, point the worker at it with `"yield_lock"`
+in the config file (or `SSW_YIELD_LOCK`). While that lock is held by a running program the worker takes no jobs, and
+if it appears mid-job the worker stops, gives the job back and waits.
 
 ## Run
 

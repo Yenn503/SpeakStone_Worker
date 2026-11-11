@@ -51,6 +51,8 @@ GPU_FATAL_WAIT_SECONDS = 60
 MAX_RESULT_BYTES = 4 * 1024 * 1024
 MAX_REF_BYTES = 20 * 1024 * 1024
 MAX_RESUME = 8
+YIELD_CHECK_SECONDS = 10    # spec 12a, yield
+YIELD_POLL_SECONDS = 20
 MAX_RERUNS = 2            # reruns of indextts2_worker.py after the first run
 QC_TRIES = 3              # runpod_worker.QC_TRIES: a line held this many times is final
 HELD_DIR = "_held_qc"
@@ -77,6 +79,10 @@ class ExitRun(Exception):
     def __init__(self, code, message=""):
         super().__init__(message)
         self.code = code
+
+
+class Yield(Exception):
+    """Another program holds the GPU lock: give the job back and wait."""
 
 
 class Stop(Exception):
@@ -263,6 +269,7 @@ class Config:
         self.model_dir = ""
         self.python = sys.executable
         self.need_free_mib = 5200
+        self.yield_lock = ""            # path of another program's GPU lock
         self.synth_script = ""          # test-only override of indextts2_worker.py (SSW_SYNTH_SCRIPT)
 
 
@@ -294,6 +301,7 @@ def load_config(path=None, env=None, require_key=True):
     c.api_base = str(pick("api_base", "SSW_API_BASE", DEFAULT_API_BASE)).rstrip("/")
     c.worker_key = str(pick("worker_key", "SSW_WORKER_KEY", "") or "")
     c.vercel_bypass = str(pick("vercel_bypass", "SSW_VERCEL_BYPASS", "") or "").strip()
+    c.yield_lock = str(pick("yield_lock", "SSW_YIELD_LOCK", "") or "").strip()
     c.work_dir = Path(str(pick("work_dir", "SSW_WORK_DIR", str(cdir / "work")))).expanduser().resolve()
     name = str(pick("machine_name", "SSW_MACHINE_NAME", "") or socket.gethostname().lower()).strip()
     c.machine_name = name[:64] or "worker"
@@ -518,6 +526,35 @@ def download_verified(url, dest_part, expected_bytes, expected_sha, timeout=60):
     return n, h.hexdigest()
 
 
+def _pid_alive(pid):
+    if os.name == "nt":
+        try:
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"], capture_output=True,
+                                 text=True, timeout=20).stdout
+        except Exception:
+            return True
+        return f'"{pid}"' in out
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True
+
+
+def lock_held(path):
+    """Another program's GPU lock: held if the file exists and its last token is a live PID, or it has
+    no PID and is younger than 3 h. Never created, held or deleted here."""
+    try:
+        p = Path(path)
+        text, age = p.read_text(encoding="utf-8", errors="replace").split(), time.time() - p.stat().st_mtime
+    except OSError:
+        return False
+    pid = text[-1] if text and text[-1].isdigit() else None
+    return _pid_alive(pid) if pid else age < 3 * 3600
+
+
 class Api:
     def __init__(self, base, key, timeout=30, bypass=""):
         self.base, self.key, self.timeout = base, key, timeout
@@ -576,7 +613,7 @@ class Backoff:
         self.n = 0
 
 
-# ----------------------------------------------------------------------------------------------- payload -> chunk
+# ----------------------------------------------------------------------------------------------- payload -> chunk (8.3 step 6)
 def check_payload(p):
     """-> None if usable, else (reason, message). Recipe / version problems are unsupported_recipe (not retryable)."""
     if not isinstance(p, dict):
@@ -650,7 +687,7 @@ def _post_af_problem(value):
 
 
 def build_chunk(p):
-    """Rows for indextts2_worker.py --batch-file. Exactly these 12 keys."""
+    """Rows for indextts2_worker.py --batch-file. Exactly the 12 keys of the spec's step 6 table."""
     refs = {r["sha256"]: r for r in p["refs"]}
     rows = []
     for ln in sorted(p["lines"], key=lambda x: x["i"]):
@@ -693,6 +730,8 @@ class JobCtx:
             raise LeaseLost(self.lost_status)
         if self.worker is not None and self.worker.stop_requested():
             raise Stop()
+        if self.worker is not None and self.worker.yield_busy():
+            raise Yield()
 
     def lines_done(self):
         seen = set()
@@ -766,6 +805,8 @@ class Worker:
         self.session_audio = 0.0
         self.session_words = 0
         self._signals = 0
+        self._yield_at = 0.0
+        self._yield_last = False
 
     # ---- stop / sleep
     def request_stop(self, why="stop"):
@@ -779,6 +820,17 @@ class Worker:
                 kill_tree(ctx.proc)
             os._exit(1)
         self.request_stop("signal")
+
+    def yield_busy(self, force=False):
+        """True while the configured GPU lock is held. Checked at most every YIELD_CHECK_SECONDS unless forced."""
+        path = getattr(self.cfg, "yield_lock", "")
+        if not path:
+            return False
+        now = time.time()
+        if not force and now - self._yield_at < YIELD_CHECK_SECONDS:
+            return self._yield_last
+        self._yield_at, self._yield_last = now, lock_held(path)
+        return self._yield_last
 
     def stop_requested(self):
         if self.stop_event.is_set():
@@ -896,7 +948,7 @@ class Worker:
                     rmtree_retry(d)
         return ids[:MAX_RESUME]
 
-    # ---- startup
+    # ---- startup (8.3 step 1)
     def startup(self):
         mdir = Path(self.cfg.model_dir)
         if not mdir.is_dir() or not (mdir / "config.yaml").exists():
@@ -923,6 +975,9 @@ class Worker:
             self.log.event("start", None, label=str(w.get("label", ""))[:40], tier=w.get("tier"), status=w.get("status"))
 
     def wait_for_vram(self):
+        while self.yield_busy(force=True):
+            self.log.event("idle", None, reason="yield", wait=YIELD_POLL_SECONDS)
+            self.sleep(YIELD_POLL_SECONDS)
         need = self.cfg.need_free_mib
         if need <= 0 or self.skip_vram_wait:
             return
@@ -1046,6 +1101,10 @@ class Worker:
             kill_tree(ctx.proc)
             self.release(ctx)
             raise
+        except Yield:
+            kill_tree(ctx.proc)
+            self.release(ctx, "yielded to local GPU work")
+            self.log.event("idle", job_id, reason="yield")
         except ExitRun:
             kill_tree(ctx.proc)
             raise
@@ -1064,10 +1123,10 @@ class Worker:
             self.log.event("idle", None, reason="gpu_fatal", wait=after_wait)
             self.sleep(after_wait)
 
-    def release(self, ctx):
+    def release(self, ctx, message="worker stopped"):
         """Ctrl+C / STOP: give the job back (attempt refunded). One try only: the user wants out."""
         try:
-            self.post_job("fail", {"reason": "released", "message": "worker stopped", "retryable": True}, ctx,
+            self.post_job("fail", {"reason": "released", "message": message, "retryable": True}, ctx,
                           retry=False)
             self.log.event("fail", ctx.job_id, reason="released")
         except (LeaseLost, NetError, ExitRun) as e:
@@ -1146,7 +1205,7 @@ class Worker:
                        already=data.get("already"))
         self.delete_job_dir(ctx.job_id)
 
-    # ---- refs
+    # ---- refs (8.3 step 5)
     def ensure_refs(self, ctx, ref_urls):
         self.refs_dir.mkdir(parents=True, exist_ok=True)
         for r in ctx.payload["refs"]:
@@ -1186,7 +1245,7 @@ class Worker:
                 part.unlink(missing_ok=True)
                 raise JobFail("ref_download", f"reference download failed: {last}"[:200], True, True)
 
-    # ---- the subprocess
+    # ---- the subprocess (8.3 step 7)
     def synth_command(self, ctx):
         script = self.cfg.synth_script or str(Path(__file__).resolve().with_name("indextts2_worker.py"))
         return [self.cfg.python, script, "--batch-file", str(ctx.dir / "chunk.json"), "--output-dir", str(ctx.out),
@@ -1233,7 +1292,7 @@ class Worker:
         except OSError:
             return False
 
-    # ---- what the subprocess made
+    # ---- what the subprocess made (8.3 step 9)
     def scan(self, ctx):
         prov = {}
         for rec in read_jsonl(ctx.out / PROV_LOG):
@@ -1260,7 +1319,7 @@ class Worker:
                 res[i] = {"kind": "missing", "path": None, "rec": {}, "final": False, "duration_sec": None}
         return res
 
-    # ---- upload
+    # ---- upload (8.3 step 10)
     def upload_all(self, ctx, st):
         files = []
         for i, v in st.items():
