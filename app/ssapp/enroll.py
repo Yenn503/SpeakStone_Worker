@@ -5,6 +5,7 @@ variable, and is never printed, logged or kept by this app.
 """
 import json
 import socket
+import sys
 import urllib.error
 import urllib.request
 
@@ -17,7 +18,9 @@ DEFAULT_API = "https://speakstone.beanw.co.uk"
 def enroll(api_base, machine_name, gpu, vram_mib, opener=urllib.request.urlopen, timeout=20):
     """Return the new worker key (sswk_...). Raises SetupError with a plain-words message."""
     body = json.dumps({"machine_name": (machine_name or "")[:64], "gpu": (gpu or "")[:64],
-                       "vram_mib": int(vram_mib or 0)}).encode()
+                       "vram_mib": int(vram_mib or 0),
+                       "os": "windows" if sys.platform.startswith("win") else "linux",
+                       "worker_version": str(APP_VERSION)[:32]}).encode()
     req = urllib.request.Request(api_base.rstrip("/") + "/api/worker/enroll", data=body, method="POST",
                                  headers={"Content-Type": "application/json",
                                           "User-Agent": f"SpeakStoneWorkerApp/{APP_VERSION}"})

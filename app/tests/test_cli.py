@@ -92,7 +92,8 @@ def test_enroll_posts_the_machine_and_returns_the_key():
 
     assert enroll.enroll("https://x.test/", "PC-1", "RTX 3060", 12288, opener=opener) == KEY
     assert seen["url"] == "https://x.test/api/worker/enroll" and seen["auth"] is None
-    assert seen["body"] == {"machine_name": "PC-1", "gpu": "RTX 3060", "vram_mib": 12288}
+    assert {k: seen["body"][k] for k in ("machine_name", "gpu", "vram_mib")} == {"machine_name": "PC-1", "gpu": "RTX 3060", "vram_mib": 12288}
+    assert seen["body"]["os"] in ("windows", "linux") and seen["body"]["worker_version"]
 
 
 def test_enroll_failures_are_plain_words_and_never_show_a_key():
