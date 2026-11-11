@@ -2,19 +2,18 @@
 
 One program that sets up and runs the SpeakStone worker for you. Unofficial; not affiliated with Blizzard Entertainment.
 
-## For a home PC
+## For a home PC (v0.2.0, command-line app)
 
-1. Download `SpeakStoneWorker.exe` (from the releases page, or from the owner) and double-click it.
-2. Pick an install folder (about 20 GB free) and paste your worker key (typing is hidden). Press Install.
-   It checks your graphics card (8 GB or more), then downloads everything it needs (about 6 GB). This takes a while;
-   if it stops, run the program again and it carries on where it left off.
-3. Choose how it runs in the stats window:
-   - **Run now**: starts at once and shows live figures (voice lines made, speed, queue, time left, card temperature).
-   - **Run when idle**: starts after the PC has had no mouse or keyboard use for N minutes (you set N), never during a
-     full-screen game or on battery, and stops the moment you come back (the current job is handed back, nothing is lost).
-     Choosing it adds a per-user log-on task so the tray icon is there after a restart; choosing another mode removes it.
-4. The tray icon (bottom right) has: Open stats, Start now, Pause 15 / 30 / 60 / 120 minutes, Quit.
-   Dot colours: grey waiting, green making, amber paused.
+1. Double-click `SpeakStoneWorker.exe`. A console opens with the SpeakStone banner and a menu.
+2. First run only: it checks your graphics card (8 GB or more), installs everything it needs (about 6 GB; torch pinned
+   to 2.8.0 for CUDA 12.8) with a progress display, then **joins the network by itself** (`POST /api/worker/enroll`):
+   there is no key to type or paste. If it stops, run it again and it carries on.
+3. Menu: **[1] Start now** (live stats board: lines, words, audio, queue and time left, GPU temperature and load bars,
+   speed sparkline, recent events, what it is making; P pause, S or Q stop and hand the job back), **[2] Install as a
+   service** (per-user log-on task plus a tray icon; makes voice lines only when the PC is idle, never during a
+   full-screen game or on battery, stops the moment you are back), **[3] Settings**, **[Q] Quit**.
+4. The tray icon has: Open board (a read-only live board in its own window), Start now, Pause, Quit.
+   `SpeakStoneWorker.exe --gui` still starts the older windowed app (kept for a later option).
 
 ## Why a log-on task and not a service
 
@@ -32,7 +31,7 @@ python -m venv .venv
 .venv\Scripts\python -m PyInstaller --noconfirm --clean SpeakStoneWorker.spec
 ```
 
-Result: `app\dist\SpeakStoneWorker.exe` (about 18 MB; the three worker scripts are inside it and copied to the install
+Result: `app\dist\SpeakStoneWorker.exe` (console app, about 21 MB; the three worker scripts are inside it and copied to the install
 folder by setup). Tests need no GPU or network.
 
 ## Updates
