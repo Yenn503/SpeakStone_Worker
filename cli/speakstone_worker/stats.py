@@ -313,12 +313,17 @@ def read_net_in(runner=subprocess.run):
 
 
 class NetMeter:
-    """MB received this job and this session. The job figure restarts when the job id changes."""
+    """MB received this job and this session, from the sum of per-sample increases (so a counter that wraps at 4 GB or
+    resets when an adapter changes never makes the figure negative). The job figure restarts when the job id changes."""
+    WRAP = 2 ** 32
 
     def __init__(self, reader=None, start_thread=True):
         self.reader = reader or read_net_in
-        self.start = self.job_base = self.last = None
+        self.prev = None
+        self.total = 0
         self.job = None
+        self.job_base = 0
+        self.seen = False
         if start_thread:
             threading.Thread(target=self._loop, daemon=True).start()
 
@@ -329,17 +334,21 @@ class NetMeter:
 
     def sample(self):
         v = self.reader()
-        if v is not None:
-            self.last = v
-            if self.start is None:
-                self.start = v
-            if self.job_base is None:
-                self.job_base = v
+        if v is None:
+            return
+        if self.prev is not None:
+            if v >= self.prev:
+                self.total += v - self.prev
+            elif self.prev > self.WRAP - 2 ** 28:       # near the top of a 32-bit counter: it wrapped
+                self.total += self.WRAP - self.prev + v
+            else:                                         # reset (adapter change): count what came in since
+                self.total += v
+        self.prev, self.seen = v, True
 
     def figures(self, job):
         """(job_mb, session_mb) or None before the first reading."""
-        if self.last is None:
+        if not self.seen:
             return None
         if job != self.job:
-            self.job, self.job_base = job, self.last
-        return ((self.last - self.job_base) / 1e6, (self.last - self.start) / 1e6)
+            self.job, self.job_base = job, self.total
+        return ((self.total - self.job_base) / 1e6, self.total / 1e6)

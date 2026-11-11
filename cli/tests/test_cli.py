@@ -832,3 +832,18 @@ def test_run_end_error_shows_in_recent_events():
     s = stats.summarize(ev, now)
     texts = " ".join(e[2] + " " + e[3] for e in s["events"])
     assert "OSError: campplus_cn_common.bin missing" in texts
+
+
+def test_net_meter_survives_wrap_and_reset_never_negative():
+    top = 2 ** 32
+    seq = iter([top - 1_000_000, 500_000, 2_500_000, 100_000, 1_100_000])   # wrap, grow, reset, grow
+    m = stats.NetMeter(reader=lambda: next(seq), start_thread=False)
+    m.sample()
+    assert m.figures("j") == (0.0, 0.0)
+    m.sample()                                   # wrapped: 1.5 MB
+    assert m.figures("j")[1] == pytest.approx(1.5)
+    m.sample()                                   # +2.0 MB
+    m.sample()                                   # reset to a low value: only the 0.1 MB since the reset
+    m.sample()                                   # +1.0 MB
+    job, session = m.figures("j")
+    assert session == pytest.approx(4.6) and job == pytest.approx(4.6) and job >= 0
