@@ -14,7 +14,7 @@ from rich.live import Live
 
 from . import APP_NAME, __version__, board, enroll as enroll_mod, idle, paths, service, setup, stats
 from .keys import KeyReader
-from .runner import WorkerRunner
+from .runner import WorkerRunner, install_close_handlers
 from .settings import Settings, in_pause_window, parse_hhmm
 
 
@@ -148,9 +148,23 @@ def start_now(console, install, settings):
     if not ensure_setup(console, install):
         return "menu"
     runner = WorkerRunner(install)
+    old = runner.find_existing()
+    if old:
+        console.print(f"\nA worker from an earlier window is still running (process {old}).")
+        console.print(f"  [{board.GOLD}][S][/] Stop it and start fresh    [{board.GOLD}][A][/] Attach to it (show the board)")
+        with KeyReader() as keys:
+            k = keys.wait()
+        runner.adopt(old)
+        if k != "a":
+            console.print("Giving its job back...")
+            runner.stop_and_wait()
+            runner = WorkerRunner(install)
+            old = None
     started, paused = time.time(), False
     col = Collector(install, paths.api_base(), started)
-    runner.start()
+    install_close_handlers(runner.shutdown_fast)
+    if not old:
+        runner.start()
     result = "menu"
     try:
         with KeyReader() as keys, Live(console=console, screen=True, auto_refresh=False) as live:
@@ -251,6 +265,7 @@ def background(install, st):
     if not setup.is_set_up(install):
         return 2
     runner = WorkerRunner(install)
+    install_close_handlers(runner.shutdown_fast)
     try:
         while True:
             background_tick(runner, st)

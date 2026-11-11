@@ -312,3 +312,154 @@ def test_runner_stop_uses_stop_file_and_hides_key(tmp_path):
     assert "SSW_WORKER_KEY" not in seen["env"] and KEY not in " ".join(seen["cmd"])
     r.request_stop()
     assert (tmp_path / "work" / "STOP").exists()
+
+
+# ------------------------------------------------------------------ first-job warm-up
+def test_extras_step_prefetches_engine_files_into_install_cache(tmp_path):
+    calls = []
+    setup.run_setup(make_env(tmp_path, calls, []))
+    cmd, e = [(c, e) for c, e in calls if "hf_hub_download(" in " ".join(map(str, c))][0]
+    code = cmd[-1]
+    for needle in ("facebook/w2v-bert-2.0", "amphion/MaskGCT", "semantic_codec/model.safetensors", "funasr/campplus",
+                   "campplus_cn_common.bin", "nvidia/bigvgan_v2_22khz_80band_256x"):
+        assert needle in code, needle
+    assert e["HF_HUB_ENABLE_HF_TRANSFER"] == "0" and e["HF_HOME"].endswith("hf")
+    assert "torch" not in code and "cuda" not in code.lower()
+    assert "extras" in setup.STEPS and "2 GB" in setup.LABELS["extras"]
+
+
+def test_runner_uses_install_hf_cache(tmp_path):
+    from speakstone_worker.runner import WorkerRunner
+    assert WorkerRunner(tmp_path).environment({})["HF_HOME"] == str(tmp_path / "hf")
+
+
+def test_board_getting_ready_while_idle_gpu_and_no_lines():
+    s = sample_state()
+    s.update(job_lines=0)
+    s["gpu"] = dict(s["gpu"], util_pct=3)
+    out = plain(board.render_board(s))
+    assert "Getting ready: first job loads the voice engine (a minute or two)" in out
+    s["gpu"]["util_pct"] = 80
+    assert "Getting ready" not in plain(board.render_board(s))
+    assert "Getting ready" not in plain(board.render_board(sample_state()))
+
+
+# ------------------------------------------------------------------ closing the window must not orphan the worker
+class FakeK32:
+    def __init__(self, ok=True):
+        self.calls, self.ok = [], ok
+        self.CreateJobObjectW = type("F", (), {"restype": None})()
+        self.OpenProcess = type("F", (), {"restype": None})()
+
+    def _f(self, name, ret):
+        def f(*a):
+            self.calls.append((name, a))
+            return ret
+        return f
+
+    def __getattr__(self, name):
+        raise AttributeError(name)
+
+
+def make_k32(ok=True):
+    k = FakeK32(ok)
+    flags = {}
+
+    def create(*a):
+        k.calls.append(("create", a))
+        return 77
+    create.restype = None
+    k.CreateJobObjectW = create
+
+    def setinfo(job, cls, ref, size):
+        import ctypes
+        flags["cls"] = cls
+        flags["flags"] = ctypes.cast(ref, ctypes.POINTER(ctypes.c_int64 * 4)).contents[2] & 0xFFFFFFFF
+        return 1 if ok else 0
+    k.SetInformationJobObject = setinfo
+    k.flags = flags
+    return k
+
+
+def test_job_object_is_kill_on_close():
+    from speakstone_worker import runner as r
+    k = make_k32()
+    assert r.create_kill_on_close_job(k) == 77
+    assert k.flags["cls"] == 9 and k.flags["flags"] & 0x2000
+    assert r.create_kill_on_close_job(make_k32(ok=False)) is None
+
+
+def test_assign_to_job_uses_process_handle():
+    from speakstone_worker import runner as r
+    k = FakeK32()
+    k.OpenProcess = lambda *a: 5
+    k.OpenProcess.restype = None
+    k.AssignProcessToJobObject = lambda j, h: 1
+    k.CloseHandle = lambda h: 1
+    assert r.assign_to_job(77, 1234, k) is True
+
+
+def test_close_events_cover_close_logoff_shutdown():
+    from speakstone_worker import runner as r
+    assert set(r.CLOSE_EVENTS) == {2, 5, 6}
+
+
+class _Proc:
+    def __init__(self, pid=4242):
+        self.pid, self.alive, self.killed = pid, True, False
+
+    def poll(self):
+        return None if self.alive else 0
+
+    def terminate(self):
+        self.alive = False
+
+
+def test_shutdown_fast_writes_stop_first_then_kills_leftovers(tmp_path, monkeypatch):
+    from speakstone_worker import runner as r
+    killed = []
+    monkeypatch.setattr(r, "kill_pid_tree", lambda pid: killed.append(pid))
+    t = [0.0]
+    w = r.WorkerRunner(tmp_path, popen=lambda *a, **k: _Proc(), clock=lambda: t[0])
+    w.proc = _Proc()
+    w.shutdown_fast(wait=1.0, sleep=lambda s: t.__setitem__(0, t[0] + s))
+    assert (tmp_path / "work" / "STOP").exists()
+    assert killed == [4242]                      # still alive after the wait, so ended
+    killed.clear()
+    w.proc.alive = False
+    w.shutdown_fast(wait=1.0, sleep=lambda s: None)
+    assert killed == []
+
+
+def test_existing_worker_detected_by_pid_file(tmp_path, monkeypatch):
+    from speakstone_worker import runner as r
+    w = r.WorkerRunner(tmp_path)
+    assert w.find_existing() is None
+    (tmp_path / "work").mkdir()
+    w.pid_file.write_text("999", encoding="utf-8")
+    monkeypatch.setattr(r, "pid_is_ours", lambda pid, py: pid == 999)
+    assert w.find_existing() == 999
+    w.adopt(999)
+    assert w.running
+    monkeypatch.setattr(r, "pid_is_ours", lambda pid, py: False)
+    assert w.find_existing() is None and not w.pid_file.exists()
+    assert not w.running
+
+
+def test_start_records_pid_and_new_session_on_linux(tmp_path, monkeypatch):
+    from speakstone_worker import runner as r
+    seen = {}
+
+    def popen(cmd, **kw):
+        seen.update(kw)
+        return _Proc(31337)
+    monkeypatch.setattr(r.sys, "platform", "linux")
+    w = r.WorkerRunner(tmp_path, popen=popen)
+    assert w.start()
+    assert seen.get("start_new_session") is True
+    assert w.pid_file.read_text() == "31337"
+
+
+def test_pid_is_ours_rejects_dead_or_other_pid(tmp_path):
+    from speakstone_worker import runner as r
+    assert r.pid_is_ours(2 ** 22 + 12345, tmp_path / "python") is False

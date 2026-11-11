@@ -4,7 +4,7 @@ Every outside effect (download, run a program, enrol, read the GPU) is passed in
 whole list with fakes. The worker key goes to `net_worker.py init` through SSW_WORKER_KEY in the child's
 environment only: never a command line, never a log line, never a file of ours.
 
-  uv (portable) -> Python 3.11 -> index-tts 830f6f8 -> packages -> torch (PINNED) -> model -> ffmpeg -> enrol -> check
+  uv (portable) -> Python 3.11 -> index-tts 830f6f8 -> packages -> torch (PINNED) -> model -> extras -> ffmpeg -> enrol -> check
 """
 import json
 import os
@@ -33,9 +33,18 @@ TORCH_INDEX = "https://download.pytorch.org/whl/cu128"
 # The owner hit this: an unpinned `--reinstall torch` pulled 2.11, which the voice engine does not work with.
 TORCH_PINS = ("torch==2.8.0+cu128", "torchaudio==2.8.0+cu128")
 MODEL_REPO = "IndexTeam/IndexTTS-2"
+# What the engine (commit 830f6f8, indextts/infer_v2.py + utils/maskgct_utils.py) fetches on its first job.
+EXTRA_SNAPSHOTS = (
+    ("facebook/w2v-bert-2.0", ["*.json", "*.safetensors", "*.txt"]),
+    ("nvidia/bigvgan_v2_22khz_80band_256x", ["config.json", "bigvgan_generator.pt"]),
+)
+EXTRA_FILES = (
+    ("amphion/MaskGCT", "semantic_codec/model.safetensors"),
+    ("funasr/campplus", "campplus_cn_common.bin"),
+)
 WORKER_FILES = ("net_worker.py", "indextts2_worker.py", "runpod_worker.py")
 
-STEPS = ("gpu", "folders", "worker_files", "uv", "python", "index_tts", "packages", "torch", "model", "ffmpeg",
+STEPS = ("gpu", "folders", "worker_files", "uv", "python", "index_tts", "packages", "torch", "model", "extras", "ffmpeg",
          "enroll", "check")
 LABELS = {
     "gpu": "Checking your graphics card",
@@ -47,6 +56,7 @@ LABELS = {
     "packages": "Installing the voice engine",
     "torch": "Installing the graphics-card libraries",
     "model": "Downloading the voice model (about 5.5 GB)",
+    "extras": "Fetching extra voice files (about 2 GB)",
     "ffmpeg": "Fetching audio tools",
     "enroll": "Joining the queue",
     "check": "Final check",
@@ -184,7 +194,7 @@ def _run(env, step, cmd, extra_env=None, cwd=None):
 
     def on_line(ln):
         frac = None
-        if step == "model":                          # huggingface_hub's tqdm: "Fetching 20 files:  45%|..."
+        if step in ("model", "extras"):                          # huggingface_hub's tqdm: "Fetching 20 files:  45%|..."
             m = _PCT.findall(ln)
             if m:
                 frac = min(100, int(m[-1])) / 100
@@ -299,6 +309,20 @@ def step_model(env):
     _run(env, "model", [env.py, "-c", code])
 
 
+def extras_code():
+    """Short script for the install's own Python: only downloads, never loads the voice model or the graphics card.
+    Already-fetched files are skipped and a part-finished download carries on, so a re-run is cheap."""
+    lines = ["from huggingface_hub import snapshot_download, hf_hub_download"]
+    lines += [f"snapshot_download({repo!r}, allow_patterns={pats!r})" for repo, pats in EXTRA_SNAPSHOTS]
+    lines += [f"hf_hub_download({repo!r}, filename={fn!r})" for repo, fn in EXTRA_FILES]
+    return "; ".join(lines)
+
+
+def step_extras(env):
+    # Same cache the worker uses (HF_HOME inside the install folder, set by tool_env and by the runner).
+    _run(env, "extras", [env.py, "-c", extras_code()])
+
+
 def step_ffmpeg(env):
     exe = "ffmpeg" + env._exe
     if (env.ffmpeg_dir / exe).exists():
@@ -347,7 +371,7 @@ def step_check(env):
 
 FUNCS = {"gpu": step_gpu, "folders": step_folders, "worker_files": step_worker_files, "uv": step_uv,
          "python": step_python, "index_tts": step_index_tts, "packages": step_packages, "torch": step_torch,
-         "model": step_model, "ffmpeg": step_ffmpeg, "enroll": step_enroll, "check": step_check}
+         "model": step_model, "extras": step_extras, "ffmpeg": step_ffmpeg, "enroll": step_enroll, "check": step_check}
 
 
 def is_set_up(install):

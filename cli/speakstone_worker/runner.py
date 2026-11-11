@@ -7,6 +7,148 @@ import time
 from pathlib import Path
 
 
+# ---------------------------------------------------------------- tie the worker's life to ours
+_KEEP_JOB = []                              # the one job object, kept open for the life of the app
+_KEEP = []                                  # callbacks that must live as long as the app
+
+
+def create_kill_on_close_job(kernel32=None):
+    """Windows: a Job Object that ends every process in it when its last handle closes (the app exiting however it
+    exits, including the console's X). Returns the job handle, or None when it cannot be made."""
+    import ctypes
+    from ctypes import wintypes
+    k = kernel32 or ctypes.windll.kernel32
+
+    class BASIC(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class IO(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in ("a", "b", "c", "d", "e", "f")]
+
+    class EXT(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", BASIC), ("IoInfo", IO), ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    k.CreateJobObjectW.restype = wintypes.HANDLE
+    job = k.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = EXT()
+    info.BasicLimitInformation.LimitFlags = 0x2000          # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    ok = k.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))   # ExtendedLimitInformation
+    return job if ok else None
+
+
+def assign_to_job(job, pid, kernel32=None):
+    import ctypes
+    from ctypes import wintypes
+    k = kernel32 or ctypes.windll.kernel32
+    k.OpenProcess.restype = wintypes.HANDLE
+    h = k.OpenProcess(0x0100 | 0x0001, False, pid)          # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+    if not h:
+        return False
+    ok = bool(k.AssignProcessToJobObject(job, h))
+    k.CloseHandle(h)
+    return ok
+
+
+def _same_path(a, b):
+    return os.path.normcase(os.path.realpath(str(a))) == os.path.normcase(os.path.realpath(str(b)))
+
+
+def pid_is_ours(pid, python_path):
+    """True when `pid` is alive and is the install's own python (not another program that reused the number)."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.windll.kernel32
+            k.OpenProcess.restype = wintypes.HANDLE
+            h = k.OpenProcess(0x1000, False, int(pid))      # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            try:
+                code = wintypes.DWORD()
+                k.GetExitCodeProcess(h, ctypes.byref(code))
+                if code.value != 259:                       # STILL_ACTIVE
+                    return False
+                buf = ctypes.create_unicode_buffer(1024)
+                n = wintypes.DWORD(1024)
+                if not k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                    return False
+                exe = buf.value
+            finally:
+                k.CloseHandle(h)
+        else:
+            exe = os.readlink(f"/proc/{int(pid)}/exe")
+        return _same_path(exe, python_path)
+    except (OSError, ValueError):
+        return False
+
+
+def install_close_handlers(on_close):
+    """Run `on_close()` when the console window is closed (X), the user logs off, the PC shuts down, or the app is
+    told to end (SIGBREAK / SIGTERM / SIGHUP). `on_close` must return within a few seconds: Windows allows little."""
+    import signal
+
+    def sig(_n, _f):
+        on_close()
+        raise SystemExit(0)
+    for name in ("SIGBREAK", "SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), sig)
+            except (ValueError, OSError):
+                pass
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+        def handler(ev):
+            if ev in CLOSE_EVENTS:
+                try:
+                    on_close()
+                except Exception:
+                    pass
+                return True
+            return False
+        cb = proto(handler)
+        _KEEP.append(cb)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(cb, True)
+
+
+CLOSE_EVENTS = (2, 5, 6)                    # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
+
+
+class _Adopted:
+    """Stands in for a Popen of a worker started by an earlier copy of this app."""
+
+    def __init__(self, pid, python_path):
+        self.pid, self.python_path = pid, python_path
+
+    def poll(self):
+        return None if pid_is_ours(self.pid, self.python_path) else 0
+
+    def terminate(self):
+        kill_pid_tree(self.pid)
+
+
+def kill_pid_tree(pid):
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, creationflags=0x08000000)
+        else:
+            os.killpg(os.getpgid(pid), 9)
+    except (OSError, ValueError):
+        pass
+
+
 class WorkerRunner:
     def __init__(self, install, popen=subprocess.Popen, clock=time.time, nice=False):
         self.install = Path(install)
@@ -15,6 +157,44 @@ class WorkerRunner:
         self.nice = nice                    # Linux: run at low priority (used when idle time cannot be read)
         self.proc = None
         self.stop_asked_at = 0.0
+
+    @property
+    def pid_file(self):
+        return self.work_dir / "worker.pid"
+
+    def find_existing(self):
+        """pid of a worker still running from this install folder (an earlier copy of the app), else None."""
+        try:
+            pid = int(self.pid_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return None
+        if pid_is_ours(pid, self.python):
+            return pid
+        self._drop_pid_file()
+        return None
+
+    def _drop_pid_file(self):
+        try:
+            self.pid_file.unlink()
+        except OSError:
+            pass
+
+    def adopt(self, pid):
+        self.proc = _Adopted(pid, self.python)
+        self.stop_asked_at = 0.0
+
+    def kill_tree(self):
+        """Last resort on the way out: end the worker and everything it started."""
+        if self.running and getattr(self.proc, "pid", None):
+            kill_pid_tree(self.proc.pid)
+
+    def shutdown_fast(self, wait=4.0, sleep=time.sleep):
+        """For a closing console: hand the job back (STOP file), wait a few seconds, then end whatever is left."""
+        self.request_stop()
+        end = self.clock() + wait
+        while self.running and self.clock() < end:
+            sleep(0.2)
+        self.kill_tree()
 
     @property
     def python(self):
@@ -41,6 +221,7 @@ class WorkerRunner:
         e["PATH"] = str(self.install / "ffmpeg") + os.pathsep + e.get("PATH", "")
         e["INDEXTTS2_PYTHON"] = str(self.python)
         e["INDEXTTS2_DIR"] = str(self.install / "IndexTTS-2")
+        e["HF_HOME"] = str(self.install / "hf")      # where setup pre-fetched the extra voice files
         e["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
         e["PYTHONUNBUFFERED"] = "1"
         e.pop("SSW_WORKER_KEY", None)       # the key comes from the worker's own config file
@@ -53,11 +234,28 @@ class WorkerRunner:
         kw = {}
         if sys.platform == "win32":
             kw["creationflags"] = 0x08000000        # CREATE_NO_WINDOW
-        elif self.nice:
-            kw["preexec_fn"] = lambda: os.nice(10)
+        else:
+            kw["start_new_session"] = True          # own process group, so the whole tree can end with killpg
+            if self.nice:
+                kw["preexec_fn"] = lambda: os.nice(10)
         self.proc = self.popen(self.command(), env=self.environment(), cwd=str(self.install),
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
         self.stop_asked_at = 0.0
+        pid = getattr(self.proc, "pid", None)
+        if sys.platform == "win32" and pid:
+            try:
+                if not _KEEP_JOB:
+                    _KEEP_JOB.append(create_kill_on_close_job())
+                if _KEEP_JOB[0]:
+                    assign_to_job(_KEEP_JOB[0], pid)
+            except Exception:
+                pass
+        if pid:
+            try:
+                self.work_dir.mkdir(parents=True, exist_ok=True)
+                self.pid_file.write_text(str(pid), encoding="utf-8")
+            except OSError:
+                pass
         return True
 
     def clear_stop(self):

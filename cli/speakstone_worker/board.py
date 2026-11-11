@@ -131,10 +131,13 @@ def render_board(s):
     elif s.get("making") and s.get("job"):
         now.append("> ", style=GOLD)
         now.append(f"Job {s['job'][:8]}", style=BIG)
-        now.append(f" - {s.get('job_lines', 0)} lines ", style=PARCH)
-        now.append("[", style=DIM)
-        now.append_text(bar(s.get("job_pct", 0.0), 19))
-        now.append(f"] {round(s.get('job_pct', 0.0) * 100)}%", style=DIM)
+        if s.get("job_lines", 0) == 0 and (g or {}).get("util_pct", 0) < 10:
+            now.append(" - Getting ready: first job loads the voice engine (a minute or two)", style=PARCH)
+        else:
+            now.append(f" - {s.get('job_lines', 0)} lines ", style=PARCH)
+            now.append("[", style=DIM)
+            now.append_text(bar(s.get("job_pct", 0.0), 19))
+            now.append(f"] {round(s.get('job_pct', 0.0) * 100)}%", style=DIM)
     else:
         now.append("> ", style=GOLD)
         now.append("Waiting for work..." if state != "stopped" else "Stopped.", style=DIM)
