@@ -195,7 +195,7 @@ def test_board_snapshot_contains_every_box():
     for needle in ("LINES TODAY", "1,284", "WORDS", "38,910", "AUDIO MINUTES", "271", "QUEUE / TIME LEFT", "12,406",
                    "~ 3 h 12 m", "GPU HEALTH", "RTX 3070 Ti", "Load", "92%", "68 C", "4.5/8 GB", "NOW MAKING",
                    "68%", "RECENT EVENTS", "done", "retry", "picked up again", "[P] pause", "[S] stop and exit",
-                   "[M] menu", "Unofficial; not affiliated with Blizzard Entertainment"):
+                   "[M] menu"):
         assert needle in out, needle
     assert "▁" in out or "█" in out
     assert "┌" in out                                     # the mock-up's square corners

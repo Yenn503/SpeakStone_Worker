@@ -160,7 +160,6 @@ def render_board(s):
     foot.append("stop and exit", style=DIM)
     foot.append("   [M] ", style=GOLD)
     foot.append("menu", style=DIM)
-    foot.append("\n " + DISCLAIMER, style=DIM)
 
     root = Layout(name="root")
     root.split_column(top, mid, Layout(_panel(now, "NOW MAKING"), name="now", size=3),
@@ -192,6 +191,6 @@ def render_setup(steps, labels, done, current, frac=None, line="", dl=None, erro
         parts.append(Text(" " + line[:100], style=DIM))
     if error:
         parts.append(Text("\n " + error, style=AMBER))
-    parts.append(Text("\n One-off setup, safe to stop and resume. " + DISCLAIMER, style=DIM))
+    parts.append(Text("\n One-off setup, safe to stop and resume. ", style=DIM))
     return Panel(Group(*parts), title=f"[{GOLD}]SPEAK STONE - FIRST-TIME SETUP[/]", title_align="left",
                  border_style=GOLD, box=box.SQUARE, style=f"on {BG}")
