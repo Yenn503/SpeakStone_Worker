@@ -1283,11 +1283,13 @@ class Worker:
             raise JobFail("other", f"complete answered HTTP {status} {code}"[:200], status == 422, status != 422)
         ok_n = sum(1 for v in st.values() if v["kind"] == "ok")
         held_n = sum(1 for v in st.values() if v["kind"] == "held")
+        job_audio = sum(float(v.get("duration_sec") or 0) for v in st.values())
+        job_words = sum(len(ln["text"].split()) for ln in ctx.payload["lines"])
         self.session_clips += ok_n + held_n
-        self.session_audio += sum(float(v.get("duration_sec") or 0) for v in st.values())
-        self.session_words += sum(len(ln["text"].split()) for ln in ctx.payload["lines"])
+        self.session_audio += job_audio
+        self.session_words += job_words
         self.log.event("complete", ctx.job_id, ok=ok_n, held=held_n, seconds=round(time.time() - t_run, 1),
-                       already=data.get("already"))
+                       already=data.get("already"), words=job_words, audio=round(job_audio))
         self.delete_job_dir(ctx.job_id)
 
     # ---- refs (8.3 step 5)

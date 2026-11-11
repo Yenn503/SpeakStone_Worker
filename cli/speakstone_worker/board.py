@@ -1,0 +1,197 @@
+"""Everything drawn on screen: banner, menu, live board, setup board. All pure functions returning rich renderables."""
+from rich import box
+from rich.console import Group
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+from . import DISCLAIMER, TAGLINE
+from .stats import format_duration
+
+GOLD, PARCH, DIM, GREEN, AMBER, BIG, BG = "#e9bb4d", "#d4bb8c", "#7d6b52", "#8fb04a", "#e0962c", "bold #f6e3b0", "#14100c"
+SPARK = "▁▂▃▄▅▆▇█"
+
+FONT = {
+    "S": ["█████", "█    ", "█████", "    █", "█████"],
+    "P": ["█████", "█   █", "█████", "█    ", "█    "],
+    "E": ["█████", "█    ", "████ ", "█    ", "█████"],
+    "A": [" ███ ", "█   █", "█████", "█   █", "█   █"],
+    "K": ["█   █", "█  █ ", "███  ", "█  █ ", "█   █"],
+    "T": ["█████", "  █  ", "  █  ", "  █  ", "  █  "],
+    "O": [" ███ ", "█   █", "█   █", "█   █", " ███ "],
+    "N": ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
+}
+
+
+def word_rows(word):
+    return ["  ".join(FONT[c][r] for c in word) for r in range(5)]
+
+
+def banner():
+    t = Text()
+    for word, col in (("SPEAK", GOLD), ("STONE", PARCH)):
+        for row in word_rows(word):
+            t.append(row.rstrip() + "\n", style=col)
+    return t
+
+
+def menu_screen(service_installed=False):
+    t = Text()
+    t.append_text(banner())
+    t.append("\n  " + TAGLINE + "\n", style=PARCH)
+    t.append("  " + DISCLAIMER + "\n\n", style=DIM)
+    items = [("1", "Start now", ""), ("2", "Uninstall the service" if service_installed else "Install as a service",
+                                      "" if service_installed else "(runs when your PC is idle)"),
+             ("3", "Settings", ""), ("Q", "Quit", "")]
+    for k, label, note in items:
+        t.append(f"  [{k}] ", style=GOLD)
+        t.append(label, style=BIG)
+        if note:
+            t.append(" " + note, style=DIM)
+        t.append("\n")
+    t.append("\n  > ", style=GOLD)
+    return t
+
+
+def bar(frac, width=18, colour=GREEN):
+    frac = max(0.0, min(1.0, frac))
+    n = round(frac * width)
+    t = Text()
+    t.append("█" * n, style=colour)
+    t.append("░" * (width - n), style=DIM)
+    return t
+
+
+def spark(values):
+    top = max(values) if values else 0
+    if top <= 0:
+        return Text(SPARK[0] * len(values), style=DIM)
+    return Text("".join(SPARK[min(7, int(v / top * 7))] if v > 0 else SPARK[0] for v in values), style=GOLD)
+
+
+def _panel(body, title, **kw):
+    return Panel(body, title=f"[{GOLD}]{title}[/]", title_align="left", border_style=GOLD, box=box.SQUARE,
+                 style=f"on {BG}", padding=(0, 1), **kw)
+
+
+def _stat(big, unit, sub, sub_style=PARCH):
+    t = Text()
+    t.append(big, style=BIG)
+    t.append("  " + unit + "\n", style=DIM)
+    t.append(sub, style=sub_style)
+    return t
+
+
+def _n(v):
+    return f"{int(v):,}"
+
+
+def render_board(s):
+    """`s` is the board state dict built by cli.board_state(). Returns a Layout."""
+    since = s.get("since_label") or "this session"
+    top = Layout(name="top", size=4)
+    top.split_row(
+        Layout(_panel(_stat(_n(s["lines"]), "lines", f"▲ {_n(s['lines_hour'])} this hour", GREEN), "LINES TODAY")),
+        Layout(_panel(_stat(_n(s["words"]), "words", f"{_n(s['words_hour'])} / hour"), "WORDS")),
+        Layout(_panel(_stat(_n(s["audio_min"]), "min", f"made since {since}"), "AUDIO MINUTES")))
+
+    q = s.get("queue")
+    ql = Text()
+    ql.append("Waiting   ")
+    ql.append(_n(q["queued_lines"]) if q else "-", style=BIG)
+    ql.append(" lines\nTime left ")
+    ql.append("~ " + format_duration(s.get("time_left")) if s.get("time_left") is not None else "-", style=GOLD)
+    ql.append("\nSpeed  ")
+    ql.append_text(spark(s.get("spark") or []))
+    ql.append("\nwords / hour, last 2 h", style=DIM)
+
+    g = s.get("gpu")
+    gt = Text()
+    if g:
+        gt.append(f"{g.get('name', 'NVIDIA graphics card')}\n", style=PARCH)
+        gt.append("Load ")
+        gt.append_text(bar(g["util_pct"] / 100))
+        gt.append(f" {g['util_pct']}%\nTemp ")
+        gt.append_text(bar(g["temp_c"] / 100, colour=AMBER if g["temp_c"] >= 70 else GREEN))
+        gt.append(f" {g['temp_c']} C\nVRAM ")
+        gt.append_text(bar(g["mem_used_mib"] / max(1, g["mem_total_mib"])))
+        gt.append(f" {g['mem_used_mib'] / 1024:.1f}/{g['mem_total_mib'] / 1024:.0f} GB")
+    else:
+        gt.append("No graphics card reading yet.", style=DIM)
+    mid = Layout(name="mid", size=6)
+    mid.split_row(Layout(_panel(ql, "QUEUE / TIME LEFT")), Layout(_panel(gt, "GPU HEALTH")))
+
+    now = Text()
+    state = s.get("state", "idle")
+    if state == "paused":
+        now.append("> ", style=GOLD)
+        now.append("Paused", style=BIG)
+        now.append(" - the current job was given back. Press [P] to carry on.", style=DIM)
+    elif s.get("making") and s.get("job"):
+        now.append("> ", style=GOLD)
+        now.append(f"Job {s['job'][:8]}", style=BIG)
+        now.append(f" - {s.get('job_lines', 0)} lines ", style=PARCH)
+        now.append("[", style=DIM)
+        now.append_text(bar(s.get("job_pct", 0.0), 19))
+        now.append(f"] {round(s.get('job_pct', 0.0) * 100)}%", style=DIM)
+    else:
+        now.append("> ", style=GOLD)
+        now.append("Waiting for work..." if state != "stopped" else "Stopped.", style=DIM)
+
+    ev = Text()
+    rows = s.get("events") or []
+    if not rows:
+        ev.append("Nothing finished yet.", style=DIM)
+    for i, (ts, kind, text, note) in enumerate(rows[:5]):
+        import time as _t
+        ev.append(_t.strftime("%H:%M", _t.localtime(ts)) + " ", style=DIM)
+        ev.append(f"{kind:<5} ", style={"done": GREEN, "retry": AMBER, "error": AMBER}.get(kind, PARCH))
+        ev.append(text + " ", style=PARCH)
+        if note:
+            ev.append(f"({note})", style=DIM)
+        if i < min(4, len(rows) - 1):
+            ev.append("\n")
+
+    foot = Text()
+    foot.append(" [P] ", style=GOLD)
+    foot.append("resume" if state == "paused" else "pause", style=DIM)
+    foot.append("   [S] ", style=GOLD)
+    foot.append("stop and exit", style=DIM)
+    foot.append("   [M] ", style=GOLD)
+    foot.append("menu", style=DIM)
+    foot.append("\n " + DISCLAIMER, style=DIM)
+
+    root = Layout(name="root")
+    root.split_column(top, mid, Layout(_panel(now, "NOW MAKING"), name="now", size=3),
+                      Layout(_panel(ev, "RECENT EVENTS"), name="events", minimum_size=7),
+                      Layout(foot, name="foot", size=2))
+    return root
+
+
+STEP_ICON = {"done": ("✓", GREEN), "run": ("●", GOLD), "todo": (" ", DIM)}
+
+
+def render_setup(steps, labels, done, current, frac=None, line="", dl=None, error=None):
+    """Setup board: steps with ticks, a bar for the current download, the last output line."""
+    t = Text()
+    for name in steps:
+        kind = "done" if name in done else ("run" if name == current else "todo")
+        icon, col = STEP_ICON[kind]
+        t.append(f" {icon} ", style=col)
+        t.append(labels[name] + "\n", style=BIG if kind == "run" else (PARCH if kind == "done" else DIM))
+    parts = [t]
+    if frac is not None:
+        b = Text(" ")
+        b.append_text(bar(frac, 40, GOLD))
+        b.append(f" {round(frac * 100)}%", style=PARCH)
+        if dl:
+            b.append("  " + dl, style=DIM)
+        parts.append(b)
+    if line:
+        parts.append(Text(" " + line[:100], style=DIM))
+    if error:
+        parts.append(Text("\n " + error, style=AMBER))
+    parts.append(Text("\n One-off setup, safe to stop and resume. " + DISCLAIMER, style=DIM))
+    return Panel(Group(*parts), title=f"[{GOLD}]SPEAK STONE - FIRST-TIME SETUP[/]", title_align="left",
+                 border_style=GOLD, box=box.SQUARE, style=f"on {BG}")
