@@ -1,0 +1,5 @@
+"""SpeakStone Worker app: setup, run now / run when idle, tray. Logic lives in plain modules (no GUI import)."""
+APP_VERSION = "0.1.0"
+APP_NAME = "SpeakStone Worker"
+DISCLAIMER = "Unofficial; not affiliated with Blizzard Entertainment."
+REPO = "dandwhelan/SpeakStone_Worker"
