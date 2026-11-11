@@ -13,9 +13,19 @@ from rich.console import Console
 from rich.live import Live
 
 from . import APP_NAME, __version__, board, enroll as enroll_mod, idle, paths, service, setup, stats
-from .keys import KeyReader
+from .keys import KeyReader, drain
 from .runner import WorkerGroup, install_close_handlers
 from .settings import Settings, in_pause_window, parse_hhmm
+
+
+def fresh_screen(console):
+    """Start a screen from nothing: cursor back, stale keys dropped, old text wiped."""
+    drain()
+    try:
+        console.show_cursor(True)
+    except Exception:
+        pass
+    console.clear()
 
 
 def make_console():
@@ -46,7 +56,7 @@ def worker_label(install):
 def run_setup_ui(console, install, base):
     steps, done, cur = list(setup.STEPS), set(setup.load_state(setup.Env(install, paths.resource_dir()))), [None]
     view = {"frac": None, "line": "", "dl": "", "t0": time.time()}
-    live = Live(console=console, refresh_per_second=4, transient=True)   # transient: the setup panel must not stay behind the menu
+    live = Live(console=console, refresh_per_second=4, screen=True)     # alternate screen: nothing is left behind the menu
 
     def redraw(error=None):
         live.update(board.render_setup(steps, setup.LABELS, done, cur[0], view["frac"], view["line"], view["dl"], error))
@@ -93,7 +103,7 @@ def run_setup_ui(console, install, base):
         done.update(steps)
         redraw()
         time.sleep(2)
-    console.clear()
+    fresh_screen(console)
     return None
 
 
@@ -151,6 +161,7 @@ def board_state(install, queue, gpu, state, started, now=None, events=None, work
 def start_now(console, install, settings):
     if not ensure_setup(console, install):
         return "menu"
+    fresh_screen(console)
     runner = WorkerGroup(install, settings["workers"])
     old = runner.find_existing()
     if old:
@@ -172,7 +183,7 @@ def start_now(console, install, settings):
     result = "menu"
     try:
         with KeyReader() as keys, Live(console=console, screen=True, auto_refresh=False) as live:
-            last_gpu, gpu, last_draw, last_view = 0, None, 0, None
+            last_gpu, gpu, last_draw, last_view, last_size = 0, None, 0, None, console.size
             monitor = stats.GpuMonitor()
             while True:
                 if time.time() - last_gpu > 2:
@@ -180,9 +191,10 @@ def start_now(console, install, settings):
                 state = "paused" if paused else ("stopped" if not runner.running else "idle")
                 view = board_state(install, col.queue, gpu, state, started, workers=runner.count)
                 # Redraw only every 5 s or when something changed: a 4/s full-screen redraw flickered (owner 2026-11-11).
-                if (view != last_view and time.time() - last_draw >= 2) or time.time() - last_draw >= 5:
+                resized = console.size != last_size
+                if resized or (view != last_view and time.time() - last_draw >= 2) or time.time() - last_draw >= 5:
                     live.update(board.render_board(view), refresh=True)
-                    last_draw, last_view = time.time(), view
+                    last_draw, last_view, last_size = time.time(), view, console.size
                 k = keys.poll(1.0)
                 if k == "p":
                     paused = not paused
@@ -194,6 +206,7 @@ def start_now(console, install, settings):
         result = "exit"
     finally:
         col.close()
+        fresh_screen(console)                      # the board's screen is gone: land on a clean one
         if runner.running:
             console.print("Giving the current job back before stopping...")
             runner.stop_and_wait()
@@ -203,7 +216,7 @@ def start_now(console, install, settings):
 # ---------------------------------------------------------------- settings
 def settings_menu(console, install, st):
     while True:
-        console.clear()
+        fresh_screen(console)
         console.print(f"\n[{board.GOLD}]SETTINGS[/]")
         console.print(f"  [{board.GOLD}][1][/] Idle minutes before starting: [bold]{st['idle_minutes']}[/]")
         sched = f"{st['pause_from']} - {st['pause_to']}" if st["pause_from"] and st["pause_to"] else "none"
@@ -215,10 +228,12 @@ def settings_menu(console, install, st):
         with KeyReader() as keys:
             k = keys.wait()
         if k == "1":
+            console.show_cursor(True)
             v = input("Minutes of no keyboard or mouse use before starting (1-240): ").strip()
             if v.isdigit() and 1 <= int(v) <= 240:
                 st["idle_minutes"] = int(v)
         elif k == "2":
+            console.show_cursor(True)
             v = input("Pause window as HH:MM-HH:MM (for example 18:00-23:00), blank for none: ").strip()
             m = re.match(r"^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$", v)
             if m and parse_hhmm(m.group(1)) is not None and parse_hhmm(m.group(2)) is not None:
@@ -227,8 +242,10 @@ def settings_menu(console, install, st):
                 st["pause_from"] = st["pause_to"] = ""
         elif k == "3":
             console.print("Service removed." if service.uninstall() else "No service was installed.")
+            time.sleep(1.5)
         elif k == "4":
             console.print(f"Your worker label: {worker_label(install) or '(not set up yet)'}")
+            time.sleep(2)
         elif k == "5":
             console.print(set_workers(console, install, st))
             time.sleep(2)
@@ -336,11 +353,10 @@ def main(argv=None):
         choice = "1" if a.start else None
         while True:
             if choice is None:
-                console.clear()
-                console.print(board.menu_screen(service.is_installed()), end="")
+                fresh_screen(console)
+                console.print(board.menu_panel(service.is_installed()))
                 with KeyReader() as keys:
                     choice = keys.wait()
-                console.print(choice.upper())
             if choice == "1":
                 if start_now(console, install, st) == "exit":
                     return 0

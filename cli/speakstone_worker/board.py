@@ -54,6 +54,12 @@ def menu_screen(service_installed=False):
     return t
 
 
+def menu_panel(service_installed=False):
+    """The whole menu as ONE panel, printed once; then a single key is read."""
+    return Panel(menu_screen(service_installed), title=f"[{GOLD}]MENU[/]", title_align="left", border_style=GOLD,
+                 box=box.SQUARE, style=f"on {BG}", padding=(0, 1))
+
+
 def bar(frac, width=18, colour=GREEN):
     frac = max(0.0, min(1.0, frac))
     n = round(frac * width)

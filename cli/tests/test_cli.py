@@ -633,3 +633,48 @@ def test_parse_typeperf_3d_sums_per_luid_and_hides_on_failure():
     assert stats.parse_typeperf_3d("Error: no counters") is None
     assert stats.read_3d(runner=lambda *a, **k: (_ for _ in ()).throw(OSError())) is None
     assert "3D" in plain(board.render_board(dict(sample_state(), gpu=dict(sample_state()["gpu"], util3d_pct=62))))
+
+
+# ------------------------------------------------------------------ screen transitions
+def test_menu_is_one_panel_that_fits_small_windows():
+    for w, h in ((100, 30), (80, 24)):
+        out = plain(board.menu_panel(False), width=w, height=h)
+        lines = out.rstrip("\n").split("\n")
+        assert len(lines) <= h, (w, h, len(lines))
+        assert all(len(ln) <= w for ln in lines)
+        assert "[1] Start now" in out and "[Q] Quit" in out
+
+
+def test_board_and_setup_render_in_small_windows():
+    for w, h in ((100, 30), (80, 24), (60, 20)):
+        plain(board.render_board(sample_state()), width=w, height=h)
+        out = plain(board.render_setup(list(setup.STEPS), setup.LABELS, {"gpu"}, "model", 0.3, "x"), width=w, height=h)
+        assert "FIRST-TIME SETUP" in out
+
+
+def test_fresh_screen_clears_shows_cursor_and_drops_keys(monkeypatch):
+    from speakstone_worker import cli
+    dropped = []
+    monkeypatch.setattr(cli, "drain", lambda: dropped.append(1))
+    c = Console(file=io.StringIO(), width=100, height=30, force_terminal=True, color_system=None)
+    c.print("old text")
+    c.show_cursor(False)
+    cli.fresh_screen(c)
+    out = c.file.getvalue()
+    assert dropped == [1] and "\x1b[2J" in out and out.endswith("\x1b[?25h") or "\x1b[?25h" in out
+
+
+def test_drain_empties_pending_keys_on_windows(monkeypatch):
+    import types
+    from speakstone_worker import keys
+    pending = list("abc")
+    fake = types.SimpleNamespace(kbhit=lambda: bool(pending), getwch=lambda: pending.pop(0))
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    monkeypatch.setattr(keys.sys, "platform", "win32")
+    keys.drain()
+    assert pending == []
+
+
+def test_live_boards_use_the_alternate_screen():
+    src = (Path(__file__).resolve().parents[1] / "speakstone_worker" / "cli.py").read_text(encoding="utf-8")
+    assert src.count("screen=True") == 2            # live board and setup board

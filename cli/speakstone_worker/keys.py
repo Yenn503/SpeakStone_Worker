@@ -3,6 +3,20 @@ import sys
 import time
 
 
+def drain():
+    """Throw away keys already pressed, so one that was meant for the screen being left does not act on the next."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        elif sys.stdin.isatty():
+            import termios
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
 class KeyReader:
     def __init__(self):
         self._old = None
