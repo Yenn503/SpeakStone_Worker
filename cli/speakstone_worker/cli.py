@@ -46,7 +46,7 @@ def worker_label(install):
 def run_setup_ui(console, install, base):
     steps, done, cur = list(setup.STEPS), set(setup.load_state(setup.Env(install, paths.resource_dir()))), [None]
     view = {"frac": None, "line": "", "dl": "", "t0": time.time()}
-    live = Live(console=console, refresh_per_second=8, transient=False)
+    live = Live(console=console, refresh_per_second=4, transient=True)   # transient: the setup panel must not stay behind the menu
 
     def redraw(error=None):
         live.update(board.render_setup(steps, setup.LABELS, done, cur[0], view["frac"], view["line"], view["dl"], error))
@@ -92,6 +92,8 @@ def run_setup_ui(console, install, base):
             return str(e)
         done.update(steps)
         redraw()
+        time.sleep(2)
+    console.clear()
     return None
 
 
@@ -151,14 +153,18 @@ def start_now(console, install, settings):
     runner.start()
     result = "menu"
     try:
-        with KeyReader() as keys, Live(console=console, screen=True, refresh_per_second=4) as live:
-            last_gpu, gpu = 0, None
+        with KeyReader() as keys, Live(console=console, screen=True, auto_refresh=False) as live:
+            last_gpu, gpu, last_draw, last_view = 0, None, 0, None
             while True:
                 if time.time() - last_gpu > 2:
                     gpu, last_gpu = stats.gpu_reading(), time.time()
                 state = "paused" if paused else ("stopped" if not runner.running else "idle")
-                live.update(board.render_board(board_state(install, col.queue, gpu, state, started)))
-                k = keys.poll(0.5)
+                view = board_state(install, col.queue, gpu, state, started)
+                # Redraw only every 5 s or when something changed: a 4/s full-screen redraw flickered (owner 2026-11-11).
+                if (view != last_view and time.time() - last_draw >= 2) or time.time() - last_draw >= 5:
+                    live.update(board.render_board(view), refresh=True)
+                    last_draw, last_view = time.time(), view
+                k = keys.poll(1.0)
                 if k == "p":
                     paused = not paused
                     runner.request_stop() if paused else runner.start()
@@ -178,6 +184,7 @@ def start_now(console, install, settings):
 # ---------------------------------------------------------------- settings
 def settings_menu(console, install, st):
     while True:
+        console.clear()
         console.print(f"\n[{board.GOLD}]SETTINGS[/]")
         console.print(f"  [{board.GOLD}][1][/] Idle minutes before starting: [bold]{st['idle_minutes']}[/]")
         sched = f"{st['pause_from']} - {st['pause_to']}" if st["pause_from"] and st["pause_to"] else "none"
