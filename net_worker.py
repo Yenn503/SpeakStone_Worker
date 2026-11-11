@@ -1,0 +1,1413 @@
+#!/usr/bin/env python3
+"""
+net_worker.py - the SpeakStone worker-network client.
+
+Click-and-go loop:  python net_worker.py run
+Model hash:         python net_worker.py --print-model-hash
+First-time config:  python net_worker.py init --model-dir D:\\models\\IndexTTS-2     (key from SSW_WORKER_KEY or a prompt)
+
+It claims a job from the site, fetches the voice sample clips (cached by sha256), converts the payload to the chunk
+format indextts2_worker.py already reads, runs indextts2_worker.py UNCHANGED as a subprocess, uploads the clips with
+presigned URLs and posts the result manifest. Python >= 3.10, standard library only. It imports no torch / numpy.
+
+Privacy: the worker key is never logged or printed (sswk_ + last 4 only); the text of a line is never logged.
+Exit codes: 0 stopped, 2 config error, 3 key refused (401), 4 protocol refused (426), 5 model dir missing.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ----------------------------------------------------------------------------------------------- constants
+PROTOCOL = 1
+WORKER_VERSION = "1.0.0"
+RECIPE = "idx2-v1"
+ENGINE = "indextts2"
+DEFAULT_API_BASE = "https://speakstone.beanw.co.uk"
+HEARTBEAT_SECONDS = 60
+IDLE_BASE_SECONDS = 60
+IDLE_CAP_SECONDS = 300
+BACKOFF_START = 5
+BACKOFF_CAP = 300
+VRAM_POLL_SECONDS = 30
+GPU_FATAL_WAIT_SECONDS = 60
+MAX_RESULT_BYTES = 4 * 1024 * 1024
+MAX_REF_BYTES = 20 * 1024 * 1024
+MAX_RESUME = 8
+MAX_RERUNS = 2            # reruns of indextts2_worker.py after the first run
+QC_TRIES = 3              # runpod_worker.QC_TRIES: a line held this many times is final
+HELD_DIR = "_held_qc"
+QC_LOG = "_qc_held.jsonl"
+PROV_LOG = "generation_provenance.jsonl"
+GPU_UNSAFE_MARKER = "GPU state is unsafe"
+KEY_RE = re.compile(r"^sswk_[A-Za-z0-9_-]{43}$")
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+BITRATE_RE = re.compile(r"^[0-9]{2,3}k$")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+LIVE_KEYS = ("gpu_util", "gpu_mem_used_mib", "vram_free_mib", "session_started_at", "session_clips",
+             "session_audio_sec", "session_words", "words_per_hour", "audio_sec_per_hour")
+
+EXIT_OK, EXIT_CONFIG, EXIT_KEY, EXIT_PROTOCOL, EXIT_MODEL = 0, 2, 3, 4, 5
+
+
+# ----------------------------------------------------------------------------------------------- exceptions
+class ConfigError(Exception):
+    pass
+
+
+class ExitRun(Exception):
+    def __init__(self, code, message=""):
+        super().__init__(message)
+        self.code = code
+
+
+class Stop(Exception):
+    """Ctrl+C or the STOP file."""
+
+
+class LeaseLost(Exception):
+    """404 / 409 / 410 from a job-scoped route: the job is no longer ours."""
+    def __init__(self, status):
+        super().__init__(f"lease lost (HTTP {status})")
+        self.status = status
+
+
+class NetError(Exception):
+    """Network failure or a transient server answer (5xx, 429): retried with backoff."""
+
+
+class JobFail(Exception):
+    def __init__(self, reason, message, retryable, delete_dir):
+        super().__init__(message)
+        self.reason, self.message, self.retryable, self.delete_dir = reason, message, retryable, delete_dir
+
+
+# ----------------------------------------------------------------------------------------------- small helpers
+def utc_iso(ts=None):
+    d = datetime.fromtimestamp(ts, timezone.utc) if ts is not None else datetime.now(timezone.utc)
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def mask_key(key):
+    return "sswk_..." + key[-4:] if key else "(none)"
+
+
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def describe_exc(e):
+    """A short, URL-free description of an exception (presigned URLs are secrets too)."""
+    return _URL_RE.sub("<url>", f"{type(e).__name__}: {e}")[:200]
+
+
+def default_config_dir():
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "SpeakStoneWorker"
+    return Path.home() / ".config" / "speakstone-worker"
+
+
+def secure_file(path):
+    """User-only permissions where the OS supports it. Best effort, never fatal."""
+    try:
+        if os.name == "nt":
+            user = os.environ.get("USERNAME") or getpass.getuser()
+            subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(R,W)"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        else:
+            os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def write_config(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(tmp), flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    secure_file(tmp)
+    os.replace(str(tmp), str(path))
+    secure_file(path)
+
+
+def atomic_write_json(path, obj):
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+def read_jsonl(path):
+    rows = []
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return rows
+    for line in text.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            rows.append(rec)
+    return rows
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def kill_tree(proc):
+    """Kill a subprocess and everything it started (Windows: taskkill /T, POSIX: its process group)."""
+    if proc is None:
+        return
+    pid = proc.pid
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=20)
+        else:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=15)
+    except Exception:
+        pass
+
+
+def popen_tree_kwargs():
+    """Popen kwargs that make kill_tree work: own process group / session."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
+def rmtree_retry(path):
+    for attempt in range(6):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            time.sleep(0.3 * (attempt + 1))
+    shutil.rmtree(path, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------------------------------- GPU (one function)
+NULL_GPU = {"name": None, "vram_total_mib": None, "vram_free_mib": None, "gpu_mem_used_mib": None, "gpu_util": None}
+
+
+def query_gpu():
+    """The only place nvidia-smi is called. Degrades to nulls when it is missing or unreadable."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,memory.free,memory.used,utilization.gpu",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=15)
+        if r.returncode != 0 or not r.stdout.strip():
+            return dict(NULL_GPU)
+        parts = [p.strip() for p in r.stdout.strip().splitlines()[0].split(",")]
+        if len(parts) < 5:
+            return dict(NULL_GPU)
+
+        def num(s):
+            try:
+                return int(float(s))
+            except ValueError:
+                return None
+        return {"name": parts[0][:64] or None, "vram_total_mib": num(parts[1]), "vram_free_mib": num(parts[2]),
+                "gpu_mem_used_mib": num(parts[3]), "gpu_util": num(parts[4])}
+    except (OSError, subprocess.SubprocessError):
+        return dict(NULL_GPU)
+
+
+# ----------------------------------------------------------------------------------------------- config
+class Config:
+    def __init__(self):
+        self.path = None
+        self.api_base = DEFAULT_API_BASE
+        self.worker_key = ""
+        self.work_dir = None
+        self.machine_name = ""
+        self.model_dir = ""
+        self.python = sys.executable
+        self.need_free_mib = 5200
+        self.synth_script = ""          # test-only override of indextts2_worker.py (SSW_SYNTH_SCRIPT)
+
+
+def load_config(path=None, env=None, require_key=True):
+    env = os.environ if env is None else env
+    cdir = default_config_dir()
+    cpath = Path(path) if path else cdir / "config.json"
+    data = {}
+    if cpath.exists():
+        try:
+            data = json.loads(cpath.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise ConfigError(f"cannot read config file {cpath}: {type(e).__name__}") from None
+        if not isinstance(data, dict):
+            raise ConfigError(f"config file {cpath} must hold a JSON object")
+        secure_file(cpath)
+    elif path:
+        raise ConfigError(f"config file {cpath} not found")
+
+    def pick(file_key, env_key, default=None):
+        v = env.get(env_key) if env_key else None
+        if v not in (None, ""):
+            return v
+        v = data.get(file_key)
+        return default if v in (None, "") else v
+
+    c = Config()
+    c.path = cpath
+    c.api_base = str(pick("api_base", "SSW_API_BASE", DEFAULT_API_BASE)).rstrip("/")
+    c.worker_key = str(pick("worker_key", "SSW_WORKER_KEY", "") or "")
+    c.vercel_bypass = str(pick("vercel_bypass", "SSW_VERCEL_BYPASS", "") or "").strip()
+    c.work_dir = Path(str(pick("work_dir", "SSW_WORK_DIR", str(cdir / "work")))).expanduser().resolve()
+    name = str(pick("machine_name", "SSW_MACHINE_NAME", "") or socket.gethostname().lower()).strip()
+    c.machine_name = name[:64] or "worker"
+    c.model_dir = str(pick("model_dir", "INDEXTTS2_DIR", "") or "")
+    c.python = str(pick("python", "INDEXTTS2_PYTHON", sys.executable))
+    c.synth_script = str(pick("synth_script", "SSW_SYNTH_SCRIPT", "") or "")
+    try:
+        c.need_free_mib = int(pick("need_free_mib", "SSW_NEED_FREE_MIB", 5200))
+        if c.need_free_mib < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ConfigError("need_free_mib must be a whole number of MiB (0 or more)") from None
+    parts = urllib.parse.urlsplit(c.api_base)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ConfigError("api_base must be an http(s) URL")
+    if parts.scheme == "http" and parts.hostname not in LOOPBACK:
+        raise ConfigError("api_base must be https (plain http is only allowed for localhost)")
+    if require_key:
+        if not c.worker_key:
+            raise ConfigError("worker_key is required (config file or SSW_WORKER_KEY)")
+        if not KEY_RE.match(c.worker_key):
+            raise ConfigError("worker_key is not a valid sswk_ key (it must be sswk_ + 43 characters)")
+    if not c.model_dir:
+        raise ConfigError("model_dir is required (config file or INDEXTTS2_DIR)")
+    return c
+
+
+# ----------------------------------------------------------------------------------------------- model hash
+def list_model_files(model_dir):
+    """[relpath, size, mtime_ns] for every regular file, skipping dot paths and __pycache__, sorted by UTF-8 bytes."""
+    out = []
+    root = str(model_dir)
+    for cur, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+        for fn in files:
+            if fn.startswith("."):
+                continue
+            full = os.path.join(cur, fn)
+            try:
+                if not os.path.isfile(full):
+                    continue
+                st = os.stat(full)
+            except OSError:
+                continue
+            rel = Path(os.path.relpath(full, root)).as_posix()
+            out.append([rel, st.st_size, st.st_mtime_ns])
+    out.sort(key=lambda t: t[0].encode("utf-8"))
+    return out
+
+
+def compute_model_hash(model_dir, cache_path=None, hash_file=sha256_file, progress=None):
+    files = list_model_files(model_dir)
+    if cache_path:
+        try:
+            cached = json.loads(Path(cache_path).read_text(encoding="utf-8"))
+            if cached.get("files") == files and re.match(r"^sha256:[0-9a-f]{64}$", str(cached.get("hash", ""))):
+                return cached["hash"]
+        except (OSError, ValueError, AttributeError):
+            pass
+    lines = []
+    for i, (rel, size, _mt) in enumerate(files):
+        if progress:
+            progress(i, len(files), rel)
+        lines.append(f"{hash_file(os.path.join(str(model_dir), *rel.split('/')))} {size} {rel}\n")
+    h = "sha256:" + hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
+    if cache_path:
+        try:
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(cache_path, {"files": files, "hash": h})
+        except OSError:
+            pass
+    return h
+
+
+def model_revision(model_dir):
+    cfg = Path(model_dir) / "config.yaml"
+    h = hashlib.sha256(cfg.read_bytes()).hexdigest()[:12] if cfg.exists() else "missing"
+    return f"IndexTeam/IndexTTS-2@cfg-{h}"
+
+
+# ----------------------------------------------------------------------------------------------- log
+class Log:
+    """One line per event: ISO time, event, job id, key=value counts. Key and line text never reach it."""
+
+    def __init__(self, logs_dir, key="", echo=True):
+        self.dir = Path(logs_dir)
+        self.key = key
+        self.echo = echo
+        self.lock = threading.Lock()
+
+    def _clean(self, s):
+        s = str(s)
+        if self.key:
+            s = s.replace(self.key, mask_key(self.key))
+        return _URL_RE.sub("<url>", s)
+
+    def event(self, name, job=None, **kv):
+        parts = [utc_iso(), name, f"job={job or '-'}"]
+        for k, v in kv.items():
+            if v is None:
+                continue
+            v = self._clean(v)
+            if re.search(r"\s", v) or not v:
+                v = json.dumps(v)
+            parts.append(f"{k}={v}")
+        line = " ".join(parts)
+        with self.lock:
+            try:
+                self.dir.mkdir(parents=True, exist_ok=True)
+                with open(self.dir / f"worker_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log", "a",
+                          encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except OSError:
+                pass
+            if self.echo:
+                print(line, flush=True)
+
+
+# ----------------------------------------------------------------------------------------------- HTTP
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def _opener(url):
+    host = urllib.parse.urlsplit(url).hostname or ""
+    handlers = [_NoRedirect()]
+    if host in LOOPBACK:
+        handlers.append(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers)
+
+
+MAX_JSON_BYTES = 4 * 1024 * 1024      # a site JSON answer is never larger than this
+REF_MARGIN_BYTES = 1024               # a reference may overrun its declared size by this much before we stop reading
+UPLOAD_HEADERS = ("content-type", "content-length")
+
+
+def check_url(url):
+    """Only https:// URLs (loopback http:// for tests) may be opened. Any other scheme (file:, ftp:, data:, ...) is refused. -> url."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+    except (ValueError, AttributeError):
+        raise NetError("refused: not a valid URL") from None
+    if parts.scheme == "https" and host:
+        return url
+    if parts.scheme == "http" and host in LOOPBACK:
+        return url
+    raise NetError(f"refused: URL scheme {parts.scheme[:12] or '?'!r} is not allowed")
+
+
+def safe_upload_headers(headers):
+    """Of the headers the site sends with an upload URL only Content-Type and Content-Length are used."""
+    out = {}
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            if isinstance(k, str) and k.lower() in UPLOAD_HEADERS and isinstance(v, (str, int)):
+                out[k] = str(v)
+    return out
+
+
+def _read_capped(r, limit):
+    body = r.read(limit + 1)
+    if len(body) > limit:
+        raise NetError(f"response larger than {limit} bytes")
+    return body
+
+
+def http_request(method, url, headers=None, data=None, timeout=30, max_bytes=MAX_JSON_BYTES):
+    """-> (status, body bytes). Raises NetError on connection problems, a refused URL or a body over max_bytes. Never follows redirects."""
+    check_url(url)
+    req = urllib.request.Request(url, data=data, method=method, headers=dict(headers or {}))
+    try:
+        with _opener(url).open(req, timeout=timeout) as r:
+            return r.status, _read_capped(r, max_bytes)
+    except urllib.error.HTTPError as e:
+        try:
+            body = _read_capped(e, max_bytes)
+        except Exception:
+            body = b""
+        return e.code, body
+    except NetError:
+        raise
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as e:
+        raise NetError(describe_exc(e)) from None
+    except Exception as e:      # http.client errors
+        raise NetError(describe_exc(e)) from None
+
+
+def download_verified(url, dest_part, expected_bytes, expected_sha, timeout=60):
+    """Stream a presigned GET to dest_part (no Authorization header). -> (bytes, sha256). Raises NetError.
+    Never writes more than expected_bytes + REF_MARGIN_BYTES; a longer stream makes the returned count exceed expected_bytes."""
+    check_url(url)
+    req = urllib.request.Request(url, method="GET")
+    h = hashlib.sha256()
+    n = 0
+    cap = int(expected_bytes) + REF_MARGIN_BYTES
+    try:
+        with _opener(url).open(req, timeout=timeout) as r:
+            try:
+                declared = int(r.headers.get("Content-Length"))
+            except (TypeError, ValueError):
+                declared = None
+            if declared is not None and declared > cap:
+                return declared, ""                  # refused before reading a byte
+            with open(dest_part, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    n += len(chunk)
+                    if n > cap:                      # longer than declared: stop, the caller reports a mismatch
+                        break
+                    h.update(chunk)
+                    f.write(chunk)
+    except urllib.error.HTTPError as e:
+        raise NetError(f"HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as e:
+        raise NetError(describe_exc(e)) from None
+    except Exception as e:
+        raise NetError(describe_exc(e)) from None
+    return n, h.hexdigest()
+
+
+class Api:
+    def __init__(self, base, key, timeout=30, bypass=""):
+        self.base, self.key, self.timeout = base, key, timeout
+        self.bypass = bypass or ""
+
+    def _headers(self, extra=None):
+        h = {"Authorization": f"Bearer {self.key}", "Accept": "application/json",
+             "User-Agent": f"speakstone-worker/{WORKER_VERSION}"}
+        if self.bypass:
+            h["x-vercel-protection-bypass"] = self.bypass
+        h.update(extra or {})
+        return h
+
+    @staticmethod
+    def _parse(body):
+        try:
+            d = json.loads(body.decode("utf-8")) if body else {}
+            return d if isinstance(d, dict) else {}
+        except ValueError:
+            return {}
+
+    def _finish(self, status, body):
+        if status == 401:
+            raise ExitRun(EXIT_KEY, "key refused")
+        if status == 426:
+            raise ExitRun(EXIT_PROTOCOL, "protocol refused")
+        if status >= 500 or status in (408, 429):
+            raise NetError(f"HTTP {status}")
+        return status, self._parse(body)
+
+    def get_me(self):
+        s, b = http_request("GET", self.base + "/api/worker/me",
+                            self._headers({"X-Worker-Protocol": str(PROTOCOL)}), timeout=self.timeout)
+        return self._finish(s, b)
+
+    def post(self, route, body):
+        body = dict(body)
+        body["protocol"] = PROTOCOL
+        data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        s, b = http_request("POST", f"{self.base}/api/worker/{route}",
+                            self._headers({"Content-Type": "application/json"}), data=data, timeout=self.timeout)
+        return self._finish(s, b)
+
+
+class Backoff:
+    """Network errors: 5, 10, 20 ... 300 s. Resets after any good answer."""
+    def __init__(self):
+        self.n = 0
+
+    def next(self):
+        d = min(BACKOFF_START * (2 ** self.n), BACKOFF_CAP)
+        self.n += 1
+        return d
+
+    def ok(self):
+        self.n = 0
+
+
+# ----------------------------------------------------------------------------------------------- payload -> chunk
+def check_payload(p):
+    """-> None if usable, else (reason, message). Recipe / version problems are unsupported_recipe (not retryable)."""
+    if not isinstance(p, dict):
+        return "bad_job", "payload is not an object"
+    if p.get("v") != 1 or isinstance(p.get("v"), bool):
+        return "unsupported_recipe", f"payload version {p.get('v')!r} is not supported"
+    if p.get("recipe") != RECIPE:
+        return "unsupported_recipe", f"recipe {str(p.get('recipe'))[:40]!r} is not supported"
+    if p.get("engine") != ENGINE:
+        return "unsupported_recipe", f"engine {str(p.get('engine'))[:40]!r} is not supported"
+    try:
+        br = (p.get("settings") or {}).get("bitrate")
+        if not isinstance(br, str) or not BITRATE_RE.match(br):
+            return "bad_job", "settings.bitrate is invalid"
+        refs, lines = p.get("refs"), p.get("lines")
+        if not isinstance(refs, list) or not 1 <= len(refs) <= 8 or not isinstance(lines, list) or not lines:
+            return "bad_job", "refs/lines missing"
+        known = set()
+        for r in refs:
+            if (not isinstance(r, dict) or not HASH_RE.match(str(r.get("sha256", ""))) or r.get("ext") not in ("ogg", "wav")
+                    or not isinstance(r.get("bytes"), int) or not 1 <= r["bytes"] <= MAX_REF_BYTES
+                    or not isinstance(r.get("text", ""), str)):
+                return "bad_job", "a reference entry is invalid"
+            known.add(r["sha256"])
+        for n, ln in enumerate(lines):
+            if (not isinstance(ln, dict) or ln.get("i") != n or not isinstance(ln.get("text"), str) or not ln["text"]
+                    or ln.get("ref") not in known or not isinstance(ln.get("seed"), int)
+                    or not isinstance(ln.get("emo"), list) or len(ln["emo"]) != 8
+                    or not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in ln["emo"])
+                    or not isinstance(ln.get("post_af", ""), str)):
+                return "bad_job", f"line {n} is invalid"
+            why = _post_af_problem(ln.get("post_af", ""))
+            if why:
+                return "bad_job", f"line {n} post_af refused: {why}"
+    except (TypeError, AttributeError):
+        return "bad_job", "payload shape is invalid"
+    return None
+
+
+# post_af reaches `ffmpeg -af`, and a filter graph can read or write files
+# (movie/amovie, file= options, ; and [labels]). Only a linear chain of these audio filters is allowed. The SAME rule lives in
+# the site's payload check and this file (the worker must not trust the site); change all together.
+POST_AF_MAX = 500
+POST_AF_FILTERS = frozenset({"atempo", "rubberband", "bass", "treble", "aecho", "compand", "highpass", "equalizer"})
+_POST_AF_FREQ_FILTERS = frozenset({"bass", "treble", "highpass", "equalizer"})   # where f= is a frequency, not a file
+_POST_AF_DENIED_KEYS = ("file", "filename", "path", "url")
+_POST_AF_RE = re.compile(r"[a-z]+(?:=[A-Za-z0-9._:=+|-]+)?(?:,[a-z]+(?:=[A-Za-z0-9._:=+|-]+)?)*")
+
+
+def _post_af_problem(value):
+    """None when value is an allowed post_af (empty is allowed), else a short reason."""
+    if not isinstance(value, str):
+        return "not a string"
+    if value == "":
+        return None
+    if len(value) > POST_AF_MAX:
+        return "too long"
+    if _POST_AF_RE.fullmatch(value) is None:
+        return "not a plain comma chain of name=args"
+    for part in value.split(","):
+        name, _, args = part.partition("=")
+        if name not in POST_AF_FILTERS:
+            return f"filter {name!r} is not allowed"
+        for seg in args.split(":") if args else ():
+            key = seg.partition("=")[0].lower() if "=" in seg else ""
+            if key and (key in _POST_AF_DENIED_KEYS or key.startswith("file")):
+                return f"option {key!r} is not allowed"
+            if key == "f" and name not in _POST_AF_FREQ_FILTERS:
+                return "option 'f' is not allowed here"
+    return None
+
+
+def build_chunk(p):
+    """Rows for indextts2_worker.py --batch-file. Exactly these 12 keys."""
+    refs = {r["sha256"]: r for r in p["refs"]}
+    rows = []
+    for ln in sorted(p["lines"], key=lambda x: x["i"]):
+        r = refs[ln["ref"]]
+        rows.append({
+            "sound_file": f"L{ln['i']:03d}.ogg",
+            "model_engine": p["engine"],
+            "profile_key": "net_" + r["sha256"][:16],
+            "canonical_reference_clip": f"{r['sha256']}.{r['ext']}",
+            "ref_text": r.get("text", ""),
+            "cleaned_text": ln["text"],
+            "text_hash": hashlib.sha256(ln["text"].encode("utf-8")).hexdigest(),
+            "generation_seed": ln["seed"],
+            "emo_vector": ln["emo"],
+            "line_emotion": "",
+            "post_af": ln.get("post_af", ""),
+            "npc_name": "",
+        })
+    return rows
+
+
+# ----------------------------------------------------------------------------------------------- per-job context
+class JobCtx:
+    def __init__(self, job_id, lease_id, attempt, payload, jobdir):
+        self.job_id, self.lease_id, self.attempt, self.payload = job_id, lease_id, attempt, payload
+        self.dir = jobdir
+        self.out = jobdir / "out"
+        self.lost = threading.Event()
+        self.lost_status = None
+        self.fatal = None
+        self.proc = None
+        self.started_at = utc_iso()
+        self.n = len(payload.get("lines", [])) if isinstance(payload, dict) and isinstance(payload.get("lines"), list) else 0
+        self.worker = None
+
+    def check(self):
+        if self.fatal is not None:
+            raise self.fatal
+        if self.lost.is_set():
+            raise LeaseLost(self.lost_status)
+        if self.worker is not None and self.worker.stop_requested():
+            raise Stop()
+
+    def lines_done(self):
+        seen = set()
+        for d in (self.out, self.out / HELD_DIR):
+            try:
+                for e in os.scandir(d):
+                    m = re.match(r"^L(\d{3})\.ogg$", e.name)
+                    if m and e.is_file():
+                        seen.add(m.group(1))
+            except OSError:
+                pass
+        return len(seen)
+
+
+class Heartbeat(threading.Thread):
+    def __init__(self, worker, ctx, interval):
+        super().__init__(daemon=True, name="heartbeat")
+        self.w, self.ctx, self.interval = worker, ctx, interval
+        self.stop_evt = threading.Event()
+
+    def run(self):
+        while not self.stop_evt.wait(self.interval):
+            self.beat()
+
+    def beat(self):
+        w, ctx = self.w, self.ctx
+        try:
+            body = {"job_id": ctx.job_id, "lease_id": ctx.lease_id, "lines_done": ctx.lines_done(),
+                    "live": w.live_fields(ctx)}
+            status, _ = w.api.post("heartbeat", body)
+            if status in (404, 409, 410):
+                ctx.lost_status = status
+                ctx.lost.set()
+                w.log.event("lease_lost", ctx.job_id, status=status, where="heartbeat")
+        except ExitRun as e:
+            ctx.fatal = e
+        except NetError as e:
+            w.log.event("backoff", ctx.job_id, where="heartbeat", error=str(e))
+        except Exception as e:      # never let the thread die silently
+            w.log.event("error", ctx.job_id, where="heartbeat", error=describe_exc(e))
+
+    def stop(self):
+        self.stop_evt.set()
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(timeout=35)
+
+
+# ----------------------------------------------------------------------------------------------- the worker
+class Worker:
+    def __init__(self, cfg, log=None, gpu_query=query_gpu, skip_vram_wait=None, max_cycles=None,
+                 install_signals=True):
+        self.cfg = cfg
+        self.work = cfg.work_dir
+        self.jobs_dir = self.work / "jobs"
+        self.refs_dir = self.work / "refs"
+        self.log = log or Log(self.work / "logs", cfg.worker_key)
+        self.api = Api(cfg.api_base, cfg.worker_key, bypass=getattr(cfg, "vercel_bypass", ""))
+        self.gpu_query = gpu_query
+        self.skip_vram_wait = (os.environ.get("SSW_SKIP_VRAM_WAIT") == "1") if skip_vram_wait is None else skip_vram_wait
+        self.max_cycles = max_cycles
+        self.install_signals = install_signals
+        self.stop_event = threading.Event()
+        self.backoff = Backoff()
+        self.idle_delay = IDLE_BASE_SECONDS
+        self.sleep_impl = self._real_sleep       # tests replace this
+        self.model_hash = ""
+        self.revision = ""
+        self.session_started = utc_iso()
+        self.session_t0 = time.time()
+        self.session_clips = 0
+        self.session_audio = 0.0
+        self.session_words = 0
+        self._signals = 0
+
+    # ---- stop / sleep
+    def request_stop(self, why="stop"):
+        self.stop_event.set()
+
+    def _on_signal(self, signum, frame):
+        self._signals += 1
+        if self._signals > 1:               # second press: do not wait for anything
+            ctx = getattr(self, "_current", None)
+            if ctx is not None:
+                kill_tree(ctx.proc)
+            os._exit(1)
+        self.request_stop("signal")
+
+    def stop_requested(self):
+        if self.stop_event.is_set():
+            return True
+        try:
+            f = self.work / "STOP"
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+                self.stop_event.set()
+                return True
+        except OSError:
+            pass
+        return False
+
+    def _real_sleep(self, seconds, ctx=None):
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.stop_requested() or (ctx is not None and (ctx.lost.is_set() or ctx.fatal is not None)):
+                return
+            time.sleep(min(0.5, max(0.0, end - time.time())))
+
+    def sleep(self, seconds, ctx=None):
+        self.sleep_impl(seconds, ctx)
+        if self.stop_requested():
+            raise Stop()
+        if ctx is not None:
+            ctx.check()
+
+    # ---- retry wrapper
+    def call_retry(self, fn, ctx=None):
+        while True:
+            if self.stop_requested():
+                raise Stop()
+            if ctx is not None:
+                ctx.check()
+            try:
+                r = fn()
+                self.backoff.ok()
+                return r
+            except NetError as e:
+                d = self.backoff.next()
+                self.log.event("backoff", ctx.job_id if ctx else None, seconds=d, error=str(e))
+                self.sleep(d, ctx)
+
+    def post_job(self, route, body, ctx, retry=True):
+        full = dict(body)
+        full["job_id"], full["lease_id"] = ctx.job_id, ctx.lease_id
+
+        def once():
+            status, data = self.api.post(route, full)
+            if status in (404, 409, 410):
+                raise LeaseLost(status)
+            return status, data
+        if retry:
+            return self.call_retry(once, ctx)
+        return once()
+
+    # ---- telemetry
+    def live_fields(self, ctx):
+        g = self.gpu_query() or {}
+        hours = max((time.time() - self.session_t0) / 3600.0, 1e-9)
+        clips = self.session_clips + (ctx.lines_done() if ctx else 0)
+        live = {"gpu_util": g.get("gpu_util"), "gpu_mem_used_mib": g.get("gpu_mem_used_mib"),
+                "vram_free_mib": g.get("vram_free_mib"), "session_started_at": self.session_started,
+                "session_clips": clips, "session_audio_sec": round(self.session_audio, 1),
+                "session_words": self.session_words,
+                "words_per_hour": round(self.session_words / hours, 1),
+                "audio_sec_per_hour": round(self.session_audio / hours, 1)}
+        return {k: v for k, v in live.items() if v is not None and k in LIVE_KEYS}
+
+    def claim_body(self, resume):
+        g = self.gpu_query() or {}
+        body = {"worker_version": WORKER_VERSION, "engines": [ENGINE], "recipes": [RECIPE],
+                "model_hash": self.model_hash, "model_revision": self.revision[:80],
+                "machine_name": self.cfg.machine_name, "os": os_string(), "resume": resume}
+        for k_body, k_g in (("gpu", "name"), ("vram_total_mib", "vram_total_mib"), ("vram_free_mib", "vram_free_mib"),
+                            ("gpu_util", "gpu_util")):
+            if g.get(k_g) is not None:
+                body[k_body] = g[k_g]
+        return body
+
+    # ---- local job dirs
+    def safe_job_dir(self, job_id):
+        if not UUID_RE.match(str(job_id)):
+            raise ValueError("job id is not a uuid")
+        return self.jobs_dir / str(job_id)
+
+    def delete_job_dir(self, job_id):
+        try:
+            d = self.safe_job_dir(job_id)
+        except ValueError:
+            return
+        if d.exists():
+            rmtree_retry(d)
+
+    def scan_resume(self):
+        ids = []
+        if self.jobs_dir.is_dir():
+            for d in sorted(self.jobs_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                if not d.is_dir():
+                    continue
+                st = d / "state.json"
+                ok = False
+                try:
+                    s = json.loads(st.read_text(encoding="utf-8"))
+                    ok = isinstance(s, dict) and s.get("job_id") == d.name and UUID_RE.match(d.name)
+                except (OSError, ValueError):
+                    pass
+                if ok:
+                    ids.append(d.name)
+                else:
+                    rmtree_retry(d)
+        return ids[:MAX_RESUME]
+
+    # ---- startup
+    def startup(self):
+        mdir = Path(self.cfg.model_dir)
+        if not mdir.is_dir() or not (mdir / "config.yaml").exists():
+            raise ExitRun(EXIT_MODEL, f"model dir missing or incomplete: {mdir}")
+        self.work.mkdir(parents=True, exist_ok=True)
+        for d in (self.jobs_dir, self.refs_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        self.log.event("start", None, version=WORKER_VERSION, protocol=PROTOCOL, machine=self.cfg.machine_name,
+                       key=mask_key(self.cfg.worker_key), api=self.cfg.api_base)
+        self.model_hash = compute_model_hash(mdir, self.work / "model_hash.json")
+        self.revision = model_revision(mdir)
+        self.log.event("start", None, model_hash=self.model_hash, revision=self.revision)
+        while True:
+            try:
+                status, data = self.api.get_me()
+                break
+            except NetError as e:
+                d = self.backoff.next()
+                self.log.event("backoff", None, seconds=d, error=str(e), where="me")
+                self.sleep(d)
+        self.backoff.ok()
+        w = data.get("worker") if isinstance(data, dict) else None
+        if isinstance(w, dict):
+            self.log.event("start", None, label=str(w.get("label", ""))[:40], tier=w.get("tier"), status=w.get("status"))
+
+    def wait_for_vram(self):
+        need = self.cfg.need_free_mib
+        if need <= 0 or self.skip_vram_wait:
+            return
+        while True:
+            free = (self.gpu_query() or {}).get("vram_free_mib")
+            if free is None or free >= need:       # no nvidia-smi: cannot know, go on
+                return
+            self.log.event("idle", None, reason="vram", free_mib=free, need_mib=need)
+            self.sleep(VRAM_POLL_SECONDS)
+
+    # ---- main loop
+    def run(self):
+        old = {}
+        if self.install_signals and threading.current_thread() is threading.main_thread():
+            for name in ("SIGINT", "SIGBREAK", "SIGTERM"):
+                sig = getattr(signal, name, None)
+                if sig is not None:
+                    try:
+                        old[sig] = signal.signal(sig, self._on_signal)
+                    except (ValueError, OSError):
+                        pass
+        try:
+            return self._run()
+        finally:
+            for sig, h in old.items():
+                try:
+                    signal.signal(sig, h)
+                except (ValueError, OSError):
+                    pass
+
+    def _run(self):
+        try:
+            self.startup()
+            cycles = 0
+            while True:
+                if self.stop_requested():
+                    raise Stop()
+                if self.max_cycles is not None and cycles >= self.max_cycles:
+                    self.log.event("stop", None, reason="max_cycles")
+                    return EXIT_OK
+                cycles += 1
+                try:
+                    self.cycle()
+                except (Stop, ExitRun):
+                    raise
+                except Exception as e:
+                    self.log.event("error", None, where="cycle", error=describe_exc(e))
+                    self.sleep(self.backoff.next())
+        except Stop:
+            self.log.event("stop", None, reason="requested")
+            return EXIT_OK
+        except ExitRun as e:
+            self.log.event("stop", None, reason=str(e) or "exit", code=e.code)
+            return e.code
+
+    def cycle(self):
+        self.wait_for_vram()
+        resume = self.scan_resume()
+        try:
+            status, data = self.call_retry(lambda: self._claim(resume))
+        except LeaseLost:           # cannot happen on claim; keep the loop alive
+            return
+        job = data.get("job") if isinstance(data, dict) else None
+        returned = job.get("id") if isinstance(job, dict) else None
+        for jid in resume:
+            if jid != returned:
+                self.delete_job_dir(jid)
+        if not isinstance(job, dict):
+            reason = data.get("reason") or ("paused" if status == 403 else "none")
+            try:
+                wait = float(data.get("retry_after_seconds") or IDLE_BASE_SECONDS) if status == 200 else IDLE_CAP_SECONDS
+            except (TypeError, ValueError):
+                wait = IDLE_BASE_SECONDS
+            wait = self.idle_delay if self.idle_delay > wait else wait
+            self.log.event("idle", None, reason=reason, wait=wait)
+            self.idle_delay = min(wait * 2, IDLE_CAP_SECONDS)
+            self.sleep(wait)
+            return
+        self.idle_delay = IDLE_BASE_SECONDS
+        self.handle_job(job)
+
+    def _claim(self, resume):
+        status, data = self.api.post("claim", self.claim_body(resume))
+        if status == 403:
+            return status, {"job": None, "reason": "paused"}
+        if status != 200:
+            raise NetError(f"claim answered HTTP {status}")
+        return status, data
+
+    # ---- one job
+    def handle_job(self, job):
+        job_id, lease_id, payload = job.get("id"), job.get("lease_id"), job.get("payload")
+        if not (UUID_RE.match(str(job_id)) and isinstance(lease_id, str) and lease_id and isinstance(payload, dict)):
+            self.log.event("error", None, where="claim", error="malformed job answer")
+            self.sleep(self.backoff.next())
+            return
+        jobdir = self.safe_job_dir(job_id)
+        jobdir.mkdir(parents=True, exist_ok=True)
+        attempt = job.get("attempt")
+        atomic_write_json(jobdir / "state.json", {"job_id": job_id, "lease_id": lease_id, "attempt": attempt,
+                                                  "payload": payload})
+        ctx = JobCtx(job_id, lease_id, attempt, payload, jobdir)
+        ctx.worker = self
+        self._current = ctx
+        try:
+            interval = float(job.get("heartbeat_every_seconds") or HEARTBEAT_SECONDS)
+        except (TypeError, ValueError):
+            interval = HEARTBEAT_SECONDS
+        hb = Heartbeat(self, ctx, max(0.05, interval))
+        self.log.event("resume" if job.get("resumed") else "claim", job_id, attempt=attempt, lines=ctx.n,
+                       lease_until=job.get("lease_expires_at"))
+        hb.start()
+        after_wait = 0
+        try:
+            self._work(ctx, job)
+        except LeaseLost as e:
+            kill_tree(ctx.proc)
+            self.log.event("lease_lost", job_id, status=e.status)
+            self.delete_job_dir(job_id)
+        except Stop:
+            kill_tree(ctx.proc)
+            self.release(ctx)
+            raise
+        except ExitRun:
+            kill_tree(ctx.proc)
+            raise
+        except JobFail as f:
+            try:
+                self.send_fail(ctx, f)
+            except Stop:
+                self.release(ctx)
+                raise
+            if f.reason == "gpu_fatal":
+                after_wait = GPU_FATAL_WAIT_SECONDS
+        finally:
+            hb.stop()
+            self._current = None
+        if after_wait:
+            self.log.event("idle", None, reason="gpu_fatal", wait=after_wait)
+            self.sleep(after_wait)
+
+    def release(self, ctx):
+        """Ctrl+C / STOP: give the job back (attempt refunded). One try only: the user wants out."""
+        try:
+            self.post_job("fail", {"reason": "released", "message": "worker stopped", "retryable": True}, ctx,
+                          retry=False)
+            self.log.event("fail", ctx.job_id, reason="released")
+        except (LeaseLost, NetError, ExitRun) as e:
+            self.log.event("fail", ctx.job_id, reason="released", note=f"not delivered: {describe_exc(e)}")
+
+    def send_fail(self, ctx, f):
+        self.log.event("fail", ctx.job_id, reason=f.reason, retryable=f.retryable, message=f.message[:200])
+        try:
+            status, data = self.post_job("fail", {"reason": f.reason, "message": f.message[:500],
+                                                  "retryable": f.retryable}, ctx)
+            if status == 400:
+                self.log.event("error", ctx.job_id, where="fail", error=f"HTTP 400 {data.get('code', '')}")
+        except LeaseLost as e:
+            self.log.event("lease_lost", ctx.job_id, status=e.status, where="fail")
+            self.delete_job_dir(ctx.job_id)
+            return
+        if f.delete_dir:
+            self.delete_job_dir(ctx.job_id)
+
+    def _work(self, ctx, job):
+        bad = check_payload(ctx.payload)
+        if bad:
+            reason, msg = bad
+            raise JobFail(reason, msg, False, True)
+        self.ensure_refs(ctx, job.get("ref_urls") or {})
+        chunk = build_chunk(ctx.payload)
+        atomic_write_json(ctx.dir / "chunk.json", chunk)
+        ctx.out.mkdir(parents=True, exist_ok=True)
+
+        t_run = time.time()
+        runs = 0
+        while True:
+            runs += 1
+            self.log.event("run_start", ctx.job_id, run=runs, lines=ctx.n)
+            log_path = ctx.dir / "worker.log"
+            offset = log_path.stat().st_size if log_path.exists() else 0
+            rc = self.run_synth(ctx)
+            st = self.scan(ctx)
+            unsafe = self.log_has(log_path, offset, GPU_UNSAFE_MARKER)
+            self.log.event("run_end", ctx.job_id, run=runs, exit=rc,
+                           ok=sum(1 for v in st.values() if v["kind"] == "ok"),
+                           held=sum(1 for v in st.values() if v["kind"] == "held"),
+                           missing=sum(1 for v in st.values() if v["kind"] == "missing"))
+            todo = [i for i, v in st.items() if v["kind"] == "missing" or (v["kind"] == "held" and not v["final"])]
+            if not todo:
+                break
+            if unsafe:
+                raise JobFail("gpu_fatal", "GPU state is unsafe", True, False)
+            if runs > MAX_RERUNS:
+                break
+            ctx.check()
+        missing = [i for i, v in st.items() if v["kind"] == "missing"]
+        if missing:
+            raise JobFail("line_failed", f"{len(missing)} of {ctx.n} lines were not made", True, False)
+
+        for upload_round in range(3):
+            self.upload_all(ctx, st)
+            ctx.check()
+            manifest = self.build_manifest(ctx, st, t_run)
+            status, data = self.post_job("complete", {"manifest": manifest}, ctx)
+            if status == 200:
+                break
+            code = data.get("code", "")
+            if status == 422 and code in ("object_missing", "object_size_mismatch") and upload_round < 2:
+                self.log.event("upload", ctx.job_id, retry="complete answered " + code)
+                continue
+            if status == 422 and code in ("object_missing", "object_size_mismatch"):
+                raise JobFail("upload_failed", f"complete refused: {code}", True, False)
+            raise JobFail("other", f"complete answered HTTP {status} {code}"[:200], status == 422, status != 422)
+        ok_n = sum(1 for v in st.values() if v["kind"] == "ok")
+        held_n = sum(1 for v in st.values() if v["kind"] == "held")
+        self.session_clips += ok_n + held_n
+        self.session_audio += sum(float(v.get("duration_sec") or 0) for v in st.values())
+        self.session_words += sum(len(ln["text"].split()) for ln in ctx.payload["lines"])
+        self.log.event("complete", ctx.job_id, ok=ok_n, held=held_n, seconds=round(time.time() - t_run, 1),
+                       already=data.get("already"))
+        self.delete_job_dir(ctx.job_id)
+
+    # ---- refs
+    def ensure_refs(self, ctx, ref_urls):
+        self.refs_dir.mkdir(parents=True, exist_ok=True)
+        for r in ctx.payload["refs"]:
+            sha, ext, size = r["sha256"], r["ext"], r["bytes"]
+            dest = self.refs_dir / f"{sha}.{ext}"
+            if dest.is_file() and dest.stat().st_size == size:
+                continue
+            entry = ref_urls.get(sha)
+            url = entry.get("url") if isinstance(entry, dict) else None
+            if not url:
+                raise JobFail("ref_download", "no download URL for a reference", True, True)
+            try:
+                check_url(url)
+            except NetError as e:
+                raise JobFail("ref_download", str(e)[:200], True, True) from None
+            part = dest.with_name(dest.name + ".part")
+            last = ""
+            for attempt in range(1, 4):
+                ctx.check()
+                t0 = time.time()
+                try:
+                    n, got = download_verified(url, part, size, sha)
+                except NetError as e:
+                    last = str(e)
+                    self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], attempt=attempt, error=last)
+                    if attempt < 3:
+                        self.sleep(2 * attempt, ctx)
+                    continue
+                if n != size or got != sha:
+                    part.unlink(missing_ok=True)
+                    self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], result="mismatch")
+                    raise JobFail("ref_mismatch", "reference clip does not match its sha256", True, True)
+                os.replace(str(part), str(dest))
+                self.log.event("ref_fetch", ctx.job_id, ref=sha[:12], bytes=n, seconds=round(time.time() - t0, 1))
+                break
+            else:
+                part.unlink(missing_ok=True)
+                raise JobFail("ref_download", f"reference download failed: {last}"[:200], True, True)
+
+    # ---- the subprocess
+    def synth_command(self, ctx):
+        script = self.cfg.synth_script or str(Path(__file__).resolve().with_name("indextts2_worker.py"))
+        return [self.cfg.python, script, "--batch-file", str(ctx.dir / "chunk.json"), "--output-dir", str(ctx.out),
+                "--references", str(self.refs_dir), "--bitrate", ctx.payload["settings"]["bitrate"]]
+
+    def synth_env(self):
+        env = dict(os.environ)
+        env["INDEXTTS2_DIR"] = str(self.cfg.model_dir)
+        env["PYTHONUNBUFFERED"] = "1"
+        for k in ("IDX2_NUM_BEAMS", "IDX2_BEAMS_BY_EMOTION", "SSW_WORKER_KEY", "WORKER_KEY", "SSW_VERCEL_BYPASS"):
+            env.pop(k, None)
+        key = self.cfg.worker_key
+        if key:                                  # no variable of any name may carry the key (or a config path that holds it)
+            for k in [k for k, v in env.items() if v and key in v]:
+                env.pop(k, None)
+        return env
+
+    def run_synth(self, ctx):
+        ctx.check()
+        with open(ctx.dir / "worker.log", "ab") as lf:
+            proc = subprocess.Popen(self.synth_command(ctx), cwd=str(ctx.dir), env=self.synth_env(),
+                                    stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT,
+                                    **popen_tree_kwargs())
+            ctx.proc = proc
+            try:
+                while True:
+                    try:
+                        return proc.wait(timeout=0.25)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    ctx.check()
+            except BaseException:
+                kill_tree(proc)
+                raise
+            finally:
+                ctx.proc = None
+
+    @staticmethod
+    def log_has(path, offset, needle):
+        try:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                return needle in f.read().decode("utf-8", "replace")
+        except OSError:
+            return False
+
+    # ---- what the subprocess made
+    def scan(self, ctx):
+        prov = {}
+        for rec in read_jsonl(ctx.out / PROV_LOG):
+            if rec.get("sound_file"):
+                prov[rec["sound_file"]] = rec
+        qc, qc_last = {}, {}
+        for rec in read_jsonl(ctx.out / QC_LOG):
+            sf = rec.get("sound_file")
+            if sf:
+                qc[sf] = qc.get(sf, 0) + 1
+                qc_last[sf] = rec
+        res = {}
+        for i in range(ctx.n):
+            name = f"L{i:03d}.ogg"
+            f, hf = ctx.out / name, ctx.out / HELD_DIR / name
+            if f.is_file() and name in prov:
+                res[i] = {"kind": "ok", "path": f, "rec": prov[name], "final": True,
+                          "duration_sec": prov[name].get("duration_sec")}
+            elif hf.is_file():
+                last = qc_last.get(name, {})
+                res[i] = {"kind": "held", "path": hf, "rec": last, "final": qc.get(name, 0) >= QC_TRIES,
+                          "duration_sec": last.get("duration_sec")}
+            else:
+                res[i] = {"kind": "missing", "path": None, "rec": {}, "final": False, "duration_sec": None}
+        return res
+
+    # ---- upload
+    def upload_all(self, ctx, st):
+        files = []
+        for i, v in st.items():
+            size = v["path"].stat().st_size
+            if not 0 < size <= MAX_RESULT_BYTES:
+                raise JobFail("other", f"line {i} result size {size} is outside 1..{MAX_RESULT_BYTES}", True, False)
+            v["bytes"], v["sha256"] = size, sha256_file(v["path"])
+            files.append({"index": i, "bytes": v["bytes"], "sha256": v["sha256"]})
+        urls = self.request_upload_urls(ctx, files)
+        t0 = time.time()
+        for i, v in st.items():
+            ctx.check()
+            entry = urls.get(i)
+            for attempt in range(1, 4):
+                ok = False
+                try:
+                    s, _ = http_request(entry.get("method") or "PUT", entry["url"], headers=safe_upload_headers(entry.get("headers")),
+                                        data=v["path"].read_bytes(), timeout=120)
+                    ok = 200 <= s < 300
+                    err = f"HTTP {s}"
+                    refresh = s == 403
+                except NetError as e:
+                    err, refresh = str(e), False
+                if ok:
+                    break
+                self.log.event("upload", ctx.job_id, index=i, attempt=attempt, error=err)
+                if attempt == 3:
+                    raise JobFail("upload_failed", f"upload of line {i} failed: {err}"[:200], True, False)
+                self.sleep(2 * attempt, ctx)
+                if refresh:
+                    urls.update(self.request_upload_urls(ctx, [f for f in files if f["index"] == i]))
+                    entry = urls.get(i)
+            v["key"] = entry["key"]
+        self.log.event("upload", ctx.job_id, files=len(files), bytes=sum(v["bytes"] for v in st.values()),
+                       seconds=round(time.time() - t0, 1))
+
+    def request_upload_urls(self, ctx, files):
+        status, data = self.post_job("upload-urls", {"files": files}, ctx)
+        if status != 200 or not isinstance(data.get("urls"), list):
+            raise JobFail("upload_failed", f"upload-urls answered HTTP {status}", True, False)
+        out = {}
+        for e in data["urls"]:
+            if isinstance(e, dict) and isinstance(e.get("index"), int) and e.get("url") and e.get("key"):
+                try:
+                    check_url(e["url"])
+                except NetError as ex:
+                    raise JobFail("upload_failed", str(ex)[:200], True, False) from None
+                out[e["index"]] = e
+        for f in files:
+            if f["index"] not in out:
+                raise JobFail("upload_failed", "upload-urls did not return every file", True, False)
+        return out
+
+    # ---- manifest (5.4)
+    def build_manifest(self, ctx, st, t_run):
+        torch_v, lines = None, []
+        for i in range(ctx.n):
+            v, rec = st[i], st[i]["rec"]
+            line = ctx.payload["lines"][i]
+            if v["kind"] == "ok":
+                torch_v = torch_v or rec.get("torch_version")
+                lines.append({"i": i, "status": "ok", "key": v["key"], "bytes": v["bytes"], "sha256": v["sha256"],
+                              "duration_sec": rec.get("duration_sec"), "seed": rec.get("generation_seed"),
+                              "num_beams": rec.get("num_beams"), "emo": rec.get("emo_vector"),
+                              "emo_alpha": rec.get("emo_alpha"), "measured_lufs": rec.get("measured_lufs"),
+                              "level": _s200(rec.get("level")), "level_recipe": _s200(rec.get("level_recipe")),
+                              "gen_time_sec": rec.get("gen_time_sec"), "rtf": rec.get("rtf"), "qc_why": None})
+            else:
+                lines.append({"i": i, "status": "held", "key": v["key"], "bytes": v["bytes"], "sha256": v["sha256"],
+                              "duration_sec": rec.get("duration_sec"), "seed": rec.get("generation_seed"),
+                              "num_beams": None, "emo": line.get("emo"), "emo_alpha": None, "measured_lufs": None,
+                              "level": None, "level_recipe": None, "gen_time_sec": None, "rtf": None,
+                              "qc_why": _s200(rec.get("why")) or "held by worker QC"})
+        return {"v": 1, "worker_version": WORKER_VERSION, "model_hash": self.model_hash,
+                "model_revision": self.revision, "torch_version": _s200(torch_v) or "unknown",
+                "gpu": (self.gpu_query() or {}).get("name") or "unknown",
+                "bitrate": ctx.payload["settings"]["bitrate"], "started_at": ctx.started_at,
+                "finished_at": utc_iso(), "lines": lines}
+
+
+def _s200(v):
+    return None if v is None else str(v)[:200]
+
+
+def os_string():
+    s = platform.system().lower() or "unknown"
+    v = platform.version() if s == "windows" else platform.release()
+    return re.sub(r"[^A-Za-z0-9._+-]", "", f"{s}-{v}")[:64]
+
+
+# ----------------------------------------------------------------------------------------------- CLI
+def build_parser():
+    ap = argparse.ArgumentParser(prog="net_worker.py", description="SpeakStone worker-network client")
+    ap.add_argument("command", nargs="?", choices=["run", "init"], help="run: claim and make jobs; init: write config")
+    ap.add_argument("--config", help="config file (default: per-user location)")
+    ap.add_argument("--print-model-hash", action="store_true", help="print the model hash and exit")
+    ap.add_argument("--model-dir", help="init: IndexTTS-2 folder")
+    ap.add_argument("--api-base", help="init: site URL")
+    ap.add_argument("--work-dir", help="init: work folder")
+    ap.add_argument("--machine-name", help="init: name shown to the owner")
+    ap.add_argument("--ask-bypass", action="store_true",
+                    help="init: also ask for a Vercel protection-bypass secret (preview deploys)")
+    return ap
+
+
+def cmd_init(args):
+    path = Path(args.config) if args.config else default_config_dir() / "config.json"
+    key = os.environ.get("SSW_WORKER_KEY") or getpass.getpass("Worker key (input hidden): ").strip()
+    if not KEY_RE.match(key):
+        print("That is not a valid worker key (sswk_ + 43 characters).", file=sys.stderr)
+        return EXIT_CONFIG
+    data = {"worker_key": key}
+    bypass = os.environ.get("SSW_VERCEL_BYPASS")
+    if bypass is None and getattr(args, "ask_bypass", False):
+        bypass = getpass.getpass("Vercel protection-bypass secret (input hidden, blank for none): ")
+    if bypass and bypass.strip():
+        data["vercel_bypass"] = bypass.strip()
+    for k, v in (("api_base", args.api_base), ("model_dir", args.model_dir), ("work_dir", args.work_dir),
+                 ("machine_name", args.machine_name)):
+        if v:
+            data[k] = v
+    write_config(path, data)
+    print(f"Wrote {path} (key {mask_key(key)}, user-only permissions).")
+    return EXIT_OK
+
+
+def main(argv=None, env=None):
+    args = build_parser().parse_args(argv)
+    if args.command == "init":
+        return cmd_init(args)
+    if not args.command and not args.print_model_hash:
+        build_parser().print_usage(sys.stderr)
+        return EXIT_CONFIG
+    try:
+        cfg = load_config(args.config, env, require_key=not args.print_model_hash)
+    except ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    if args.print_model_hash:
+        if not Path(cfg.model_dir).is_dir():
+            print(f"model dir missing: {cfg.model_dir}", file=sys.stderr)
+            return EXIT_MODEL
+        print("hashing the model files (cached afterwards)...", file=sys.stderr)
+        print(compute_model_hash(cfg.model_dir, cfg.work_dir / "model_hash.json"))
+        return EXIT_OK
+    return Worker(cfg).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
