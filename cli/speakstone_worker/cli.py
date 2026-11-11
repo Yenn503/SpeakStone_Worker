@@ -14,7 +14,7 @@ from rich.live import Live
 
 from . import APP_NAME, __version__, board, enroll as enroll_mod, idle, paths, service, setup, stats
 from .keys import KeyReader
-from .runner import WorkerRunner, install_close_handlers
+from .runner import WorkerGroup, install_close_handlers
 from .settings import Settings, in_pause_window, parse_hhmm
 
 
@@ -75,9 +75,9 @@ def run_setup_ui(console, install, base):
     api = paths.api_base()
     host = socket.gethostname()
 
-    def do_enroll():
+    def do_enroll(machine_name=None):
         gpu = stats.gpu_reading() or {}
-        return enroll_mod.enroll(api, host, gpu.get("name", "unknown"), gpu.get("mem_total_mib", 0),
+        return enroll_mod.enroll(api, machine_name or host, gpu.get("name", "unknown"), gpu.get("mem_total_mib", 0),
                                  ("windows" if platform.system() == "Windows" else "linux"), worker_version(install))
 
     env = setup.Env(install, paths.resource_dir(), download=download, run=setup.real_run, enroll=do_enroll,
@@ -130,10 +130,14 @@ class Collector:
         self._stop = True
 
 
-def board_state(install, queue, gpu, state, started, now=None, events=None):
+def board_state(install, queue, gpu, state, started, now=None, events=None, workers=1):
     now = now or time.time()
-    ev = events if events is not None else stats.read_events(install / "work" / "logs")
-    s = stats.summarize(ev, now)
+    if events is not None:
+        s = stats.summarize(events, now)
+    else:
+        dirs = [install / "work" / "logs"] + ([install / "work_2" / "logs"] if workers == 2 else [])
+        s = stats.merge_summaries([stats.summarize(stats.read_events(d), now) for d in dirs])
+    s["workers"] = workers
     s["queue"], s["gpu"], s["state"] = queue, gpu, state
     s["time_left"] = stats.time_left(queue, s["words_hour"], s["lines_hour"])
     s["since_label"] = time.strftime("%H:%M", time.localtime(s["first_today"] or started))
@@ -147,10 +151,10 @@ def board_state(install, queue, gpu, state, started, now=None, events=None):
 def start_now(console, install, settings):
     if not ensure_setup(console, install):
         return "menu"
-    runner = WorkerRunner(install)
+    runner = WorkerGroup(install, settings["workers"])
     old = runner.find_existing()
     if old:
-        console.print(f"\nA worker from an earlier window is still running (process {old}).")
+        console.print(f"\nA worker from an earlier window is still running (process {', '.join(map(str, old.values()))}).")
         console.print(f"  [{board.GOLD}][S][/] Stop it and start fresh    [{board.GOLD}][A][/] Attach to it (show the board)")
         with KeyReader() as keys:
             k = keys.wait()
@@ -158,7 +162,7 @@ def start_now(console, install, settings):
         if k != "a":
             console.print("Giving its job back...")
             runner.stop_and_wait()
-            runner = WorkerRunner(install)
+            runner = WorkerGroup(install, settings["workers"])
             old = None
     started, paused = time.time(), False
     col = Collector(install, paths.api_base(), started)
@@ -169,11 +173,12 @@ def start_now(console, install, settings):
     try:
         with KeyReader() as keys, Live(console=console, screen=True, auto_refresh=False) as live:
             last_gpu, gpu, last_draw, last_view = 0, None, 0, None
+            monitor = stats.GpuMonitor()
             while True:
                 if time.time() - last_gpu > 2:
-                    gpu, last_gpu = stats.gpu_reading(), time.time()
+                    gpu, last_gpu = monitor.read(), time.time()
                 state = "paused" if paused else ("stopped" if not runner.running else "idle")
-                view = board_state(install, col.queue, gpu, state, started)
+                view = board_state(install, col.queue, gpu, state, started, workers=runner.count)
                 # Redraw only every 5 s or when something changed: a 4/s full-screen redraw flickered (owner 2026-11-11).
                 if (view != last_view and time.time() - last_draw >= 2) or time.time() - last_draw >= 5:
                     live.update(board.render_board(view), refresh=True)
@@ -205,6 +210,7 @@ def settings_menu(console, install, st):
         console.print(f"  [{board.GOLD}][2][/] Daily pause (no work in this window): [bold]{sched}[/]")
         console.print(f"  [{board.GOLD}][3][/] Uninstall the service")
         console.print(f"  [{board.GOLD}][4][/] Show my worker label: [bold]{worker_label(install) or '(not set up yet)'}[/]")
+        console.print(f"  [{board.GOLD}][5][/] Workers on this card: [bold]{st['workers']}[/]")
         console.print(f"  [{board.GOLD}][B][/] Back")
         with KeyReader() as keys:
             k = keys.wait()
@@ -223,8 +229,42 @@ def settings_menu(console, install, st):
             console.print("Service removed." if service.uninstall() else "No service was installed.")
         elif k == "4":
             console.print(f"Your worker label: {worker_label(install) or '(not set up yet)'}")
+        elif k == "5":
+            console.print(set_workers(console, install, st))
+            time.sleep(2)
         elif k in ("b", "q", "\x1b"):
             return
+
+
+def set_workers(console, install, st, gpu_reader=None, enroll_runner=None):
+    """Flip between 1 and 2 workers on this card. Returns the sentence to show. 2 needs room on the card at this
+    moment and a second key (kept for next time, even after switching back to 1)."""
+    if st["workers"] == 2:
+        st["workers"] = 1
+        return "One worker on this card. The second one stops the next time you start."
+    ok, why = setup.second_worker_allowed((gpu_reader or stats.gpu_reading)())
+    if not ok:
+        return why
+    if not setup.is_set_up(install):
+        return "Finish the first-time setup first (choose Start now)."
+    try:
+        (enroll_runner or enroll_second_worker)(install)
+    except (setup.SetupError, enroll_mod.EnrollError) as e:
+        return str(e)
+    st["workers"] = 2
+    return "Two workers on this card. It takes effect the next time you start."
+
+
+def enroll_second_worker(install):
+    api, host = paths.api_base(), socket.gethostname()
+
+    def do_enroll(machine_name=None):
+        gpu = stats.gpu_reading() or {}
+        return enroll_mod.enroll(api, machine_name or host, gpu.get("name", "unknown"), gpu.get("mem_total_mib", 0),
+                                 ("windows" if platform.system() == "Windows" else "linux"), worker_version(install))
+    env = setup.Env(install, paths.resource_dir(), run=setup.real_run, enroll=do_enroll,
+                    api_base=(api if os.environ.get("SPEAKSTONE_API_BASE") else ""), machine_name=host)
+    setup.enroll_second(env)
 
 
 # ---------------------------------------------------------------- background mode
@@ -264,7 +304,7 @@ def background(install, st):
     hide_console()
     if not setup.is_set_up(install):
         return 2
-    runner = WorkerRunner(install)
+    runner = WorkerGroup(install, st["workers"])
     install_close_handlers(runner.shutdown_fast)
     try:
         while True:

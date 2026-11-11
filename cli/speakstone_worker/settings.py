@@ -12,6 +12,7 @@ DEFAULTS = {
     "pause_to": "",
     "block_fullscreen": True,
     "block_on_battery": True,
+    "workers": 1,               # workers on this card: 1, or 2 on a 12 GB+ card with room
 }
 _HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 

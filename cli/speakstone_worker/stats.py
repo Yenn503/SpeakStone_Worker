@@ -3,6 +3,8 @@ Ported from app/ssapp/stats.py and extended with what the live board shows (word
 import json
 import re
 import subprocess
+import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -172,3 +174,109 @@ def time_left(queue, words_hour_est, lines_hour):
     if queue and lines_hour > 0:
         return queue["queued_lines"] / lines_hour * 3600
     return None
+
+
+def merge_summaries(parts):
+    """Add several workers' board summaries into one."""
+    if len(parts) == 1:
+        return parts[0]
+    out = dict(parts[0])
+    for k in ("lines", "words", "lines_hour", "words_hour", "errors"):
+        out[k] = sum(p[k] for p in parts)
+    out["audio_min"] = sum(p["audio_min"] for p in parts)
+    out["spark"] = [sum(v) for v in zip(*(p["spark"] for p in parts))]
+    firsts = [p["first_today"] for p in parts if p["first_today"]]
+    out["first_today"] = min(firsts) if firsts else None
+    out["events"] = sorted((e for p in parts for e in p["events"]), key=lambda e: -e[0])[:8]
+    out["avg_job_seconds"] = sum(p["avg_job_seconds"] for p in parts) / len(parts)
+    making = [p for p in parts if p["making"]]
+    out["making"] = bool(making)
+    if making:
+        best = max(making, key=lambda p: p["job_started"])
+        out["job"], out["job_lines"], out["job_started"] = best["job"], best["job_lines"], best["job_started"]
+    return out
+
+
+# ---------------------------------------------------------------- GPU utilisation, smoothed
+UTIL_WINDOW = 10.0                         # seconds of samples averaged for the board
+
+
+def rolling_avg(samples, now, window=UTIL_WINDOW):
+    """Mean of the (time, value) samples from the last `window` seconds; None when there are none."""
+    vals = [v for t, v in samples if v is not None and now - t <= window]
+    return sum(vals) / len(vals) if vals else None
+
+
+_TYPEPERF_3D = r"\GPU Engine(*engtype_3D)\Utilization Percentage"
+_LUID = re.compile(r"luid_(0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)", re.I)
+
+
+def parse_typeperf_3d(text):
+    """Windows `typeperf ... -sc 1` CSV -> 3D utilisation of the busiest adapter (sum over its engines), or None.
+    Task Manager's 3D graph is that sum per adapter, so the busiest adapter is the card doing our work."""
+    rows = [ln for ln in text.splitlines() if ln.startswith('"')]
+    if len(rows) < 2:
+        return None
+    head = [c.strip('"') for c in rows[0].split('","')]
+    vals = [c.strip('"') for c in rows[1].split('","')]
+    per = {}
+    for name, v in zip(head[1:], vals[1:]):
+        m = _LUID.search(name)
+        try:
+            x = float(v)
+        except ValueError:
+            continue
+        if m:
+            per[m.group(1)] = per.get(m.group(1), 0.0) + x
+    return min(100.0, max(per.values())) if per else None
+
+
+def read_3d(runner=subprocess.run):
+    try:
+        r = runner(["typeperf", _TYPEPERF_3D, "-sc", "1"], capture_output=True, text=True, timeout=8,
+                   creationflags=0x08000000)
+        return parse_typeperf_3d(r.stdout)
+    except Exception:
+        return None
+
+
+class GpuMonitor:
+    """nvidia-smi every call, averaged over ~10 s; on Windows also the 3D engine figure Task Manager shows (read on its
+    own thread because typeperf takes about a second). The 3D figure is dropped for good if it ever fails."""
+
+    def __init__(self, reader=None, d3_reader=None, clock=time.time, windows=None, start_thread=True):
+        self.reader, self.clock = reader or gpu_reading, clock
+        self.d3_reader = d3_reader or read_3d
+        self.util, self.d3 = [], []
+        self.d3_ok = (sys.platform == "win32") if windows is None else windows
+        self._last3d = 0.0
+        if self.d3_ok and start_thread:
+            threading.Thread(target=self._loop3d, daemon=True).start()
+
+    def _loop3d(self):
+        while self.d3_ok:
+            self.sample3d()
+            time.sleep(2)
+
+    def sample3d(self):
+        v = self.d3_reader()
+        if v is None:
+            self.d3_ok = False
+            self.d3.clear()
+        else:
+            self.d3.append((self.clock(), v))
+            del self.d3[:-20]
+
+    def read(self):
+        g = self.reader()
+        now = self.clock()
+        if not g:
+            return None
+        self.util.append((now, g["util_pct"]))
+        del self.util[:-20]
+        g = dict(g)
+        g["util_pct"] = round(rolling_avg(self.util, now))
+        d3 = rolling_avg(self.d3, now) if self.d3_ok else None
+        if d3 is not None:
+            g["util3d_pct"] = round(d3)
+        return g

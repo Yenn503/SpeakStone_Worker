@@ -193,7 +193,7 @@ def plain(renderable, width=100, height=30):
 def test_board_snapshot_contains_every_box():
     out = plain(board.render_board(sample_state()))
     for needle in ("LINES TODAY", "1,284", "WORDS", "38,910", "AUDIO MINUTES", "271", "QUEUE / TIME LEFT", "12,406",
-                   "~ 3 h 12 m", "GPU HEALTH", "RTX 3070 Ti", "Load", "92%", "68 C", "4.5/8 GB", "NOW MAKING",
+                   "~ 3 h 12 m", "GPU HEALTH", "RTX 3070 Ti", "Utilisation", "92%", "68 C", "4.5/8 GB", "NOW MAKING",
                    "68%", "RECENT EVENTS", "done", "retry", "picked up again", "[P] pause", "[S] stop and exit",
                    "[M] menu"):
         assert needle in out, needle
@@ -463,3 +463,173 @@ def test_start_records_pid_and_new_session_on_linux(tmp_path, monkeypatch):
 def test_pid_is_ours_rejects_dead_or_other_pid(tmp_path):
     from speakstone_worker import runner as r
     assert r.pid_is_ours(2 ** 22 + 12345, tmp_path / "python") is False
+
+
+# ------------------------------------------------------------------ two workers on one card (one key each)
+def gpu_rd(total, used=0):
+    return {"name": "RTX 3080 Ti Laptop", "mem_total_mib": total, "mem_used_mib": used, "util_pct": 0, "temp_c": 50}
+
+
+def test_second_worker_gate():
+    ok, _ = setup.second_worker_allowed(gpu_rd(16384, 1200))
+    assert ok
+    assert not setup.second_worker_allowed(gpu_rd(8192))[0]
+    assert not setup.second_worker_allowed(gpu_rd(12288, 4000))[0]          # only 8 GB free
+    assert setup.second_worker_allowed(gpu_rd(12288, 1500))[0]
+    assert not setup.second_worker_allowed(None)[0]
+
+
+def test_enroll_second_uses_own_name_key_config_and_work_dir(tmp_path):
+    calls, names = [], []
+    env = make_env(tmp_path, calls, [])
+    env.install.mkdir(parents=True, exist_ok=True)
+    env.machine_name = "LAPTOP"
+
+    def enr(machine_name=None):
+        names.append(machine_name)
+        return {"key": KEY, "label": "Calm Heron", "worker_id": "w2", "tier": "public"}
+    env.enroll = enr
+    orig = env.run
+
+    def run(cmd, e, cwd, on_line):
+        c = [str(x) for x in cmd]
+        if "init" in c:
+            (env.install / "worker_config_2.json").write_text("{}")
+        calls.append((c, dict(e)))
+        return 0
+    env.run = run
+    setup.enroll_second(env)
+    init = [(c, e) for c, e in calls if "init" in c][0]
+    assert names == ["LAPTOP-2"]
+    assert "worker_config_2.json" in " ".join(init[0]) and "work_2" in " ".join(init[0])
+    assert init[1]["SSW_WORKER_KEY"] == KEY and KEY not in " ".join(init[0])
+    setup.enroll_second(env)                                               # key kept: no second sign-up
+    assert names == ["LAPTOP-2"]
+
+
+def test_set_workers_gate_toggle_and_429_message(tmp_path):
+    from speakstone_worker import cli, settings
+    st = settings.Settings(tmp_path / "cli.json")
+    assert st["workers"] == 1
+    assert "12 GB" in cli.set_workers(None, tmp_path, st, gpu_reader=lambda: gpu_rd(8192))
+    assert st["workers"] == 1
+    # not set up -> asks for setup first
+    assert "setup" in cli.set_workers(None, tmp_path, st, gpu_reader=lambda: gpu_rd(16384, 100))
+    (tmp_path / "setup_state.json").write_text(json.dumps({"done": [s for s in setup.STEPS if s != "gpu"]}))
+
+    def boom(install):
+        raise enroll.EnrollError(enroll.friendly_error(429))
+    assert "Too many sign-ups" in cli.set_workers(None, tmp_path, st, gpu_reader=lambda: gpu_rd(16384, 100), enroll_runner=boom)
+    assert st["workers"] == 1
+    assert "Two workers" in cli.set_workers(None, tmp_path, st, gpu_reader=lambda: gpu_rd(16384, 100), enroll_runner=lambda i: None)
+    assert st["workers"] == 2
+    assert "One worker" in cli.set_workers(None, tmp_path, st)
+    assert settings.Settings(tmp_path / "cli.json")["workers"] == 1
+
+
+def test_group_runs_two_with_separate_dirs_and_stops_both(tmp_path, monkeypatch):
+    from speakstone_worker import runner as r
+    (tmp_path / "worker_config.json").write_text("{}")
+    (tmp_path / "worker_config_2.json").write_text("{}")
+    cmds, pids = [], iter([111, 222])
+
+    def popen(cmd, **kw):
+        cmds.append(cmd)
+        return _Proc(next(pids))
+    g = r.WorkerGroup(tmp_path, 2, popen=popen)
+    assert g.start() and len(cmds) == 2
+    assert cmds[0][-1].endswith("worker_config.json") and cmds[1][-1].endswith("worker_config_2.json")
+    assert (tmp_path / "work" / "worker.pid").read_text() == "111"
+    assert (tmp_path / "work_2" / "worker.pid").read_text() == "222"
+    g.request_stop()
+    assert (tmp_path / "work" / "STOP").exists() and (tmp_path / "work_2" / "STOP").exists()
+    killed = []
+    monkeypatch.setattr(r, "kill_pid_tree", lambda pid: killed.append(pid))
+    g.shutdown_fast(wait=0.0, sleep=lambda s: None)
+    assert sorted(killed) == [111, 222]
+    monkeypatch.setattr(r, "pid_is_ours", lambda pid, py: True)
+    assert r.WorkerGroup(tmp_path, 2).find_existing() == {1: 111, 2: 222}
+
+
+def test_group_with_one_ignores_second_but_still_knows_it(tmp_path, monkeypatch):
+    from speakstone_worker import runner as r
+    (tmp_path / "worker_config.json").write_text("{}")
+    (tmp_path / "worker_config_2.json").write_text("{}")
+    cmds = []
+    g = r.WorkerGroup(tmp_path, 1, popen=lambda c, **k: cmds.append(c) or _Proc(5))
+    g.start()
+    assert len(cmds) == 1
+    (tmp_path / "work_2").mkdir()
+    (tmp_path / "work_2" / "worker.pid").write_text("999")
+    monkeypatch.setattr(r, "pid_is_ours", lambda pid, py: pid == 999)
+    assert g.find_existing() == {2: 999}
+
+
+def test_second_without_key_falls_back_to_one(tmp_path):
+    from speakstone_worker import runner as r
+    (tmp_path / "worker_config.json").write_text("{}")
+    assert r.WorkerGroup(tmp_path, 2).count == 1
+
+
+def test_board_sums_both_workers_and_shows_header(tmp_path):
+    from speakstone_worker import cli
+    now = time.time()
+    for d, n in (("work", 3), ("work_2", 4)):
+        (tmp_path / d / "logs").mkdir(parents=True)
+        t = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - 60))
+        (tmp_path / d / "logs" / "worker_x.log").write_text(
+            f"{t} complete job=aaaaaaaa ok={n} held=0 words={n * 10} audio=30 seconds=20\n")
+    one = cli.board_state(tmp_path, None, None, "idle", now, now=now, workers=1)
+    two = cli.board_state(tmp_path, None, None, "idle", now, now=now, workers=2)
+    if one["lines"] == 3:                                    # log-line format matched
+        assert two["lines"] == 7 and two["workers"] == 2
+    s = sample_state()
+    s["workers"] = 2
+    assert "2 workers" in plain(board.render_board(s))
+    assert "2 workers" not in plain(board.render_board(sample_state()))
+
+
+def test_merge_summaries_adds_up():
+    a = stats.summarize([], 1000.0)
+    b = stats.summarize([], 1000.0)
+    a.update(lines=3, words=30, spark=[1.0] * stats.BUCKETS, making=True, job="j", job_lines=2, job_started=5.0)
+    b.update(lines=4, words=40, spark=[2.0] * stats.BUCKETS)
+    m = stats.merge_summaries([a, b])
+    assert m["lines"] == 7 and m["words"] == 70 and m["spark"][0] == 3.0 and m["making"] and m["job"] == "j"
+
+
+# ------------------------------------------------------------------ smoothed GPU utilisation
+def test_rolling_avg_window():
+    assert stats.rolling_avg([], 100) is None
+    s = [(80, 50), (91, 93), (95, 96), (99, 94)]
+    assert stats.rolling_avg(s, 100) == pytest.approx((93 + 96 + 94) / 3)      # the 50 at t=80 is outside 10 s
+    assert stats.rolling_avg(s, 100, window=30) == pytest.approx((50 + 93 + 96 + 94) / 4)
+
+
+def test_gpu_monitor_averages_and_3d_optional():
+    t = [0.0]
+    seq = iter([93, 96, 20, 95])
+    mon = stats.GpuMonitor(reader=lambda: {"util_pct": next(seq), "temp_c": 1, "mem_used_mib": 1, "mem_total_mib": 2,
+                                           "name": "x"},
+                           d3_reader=lambda: 62.4, clock=lambda: t[0], windows=True, start_thread=False)
+    out = []
+    for i in range(4):
+        t[0] = i * 2.0
+        mon.sample3d()
+        out.append(mon.read())
+    assert out[0]["util_pct"] == 93 and out[1]["util_pct"] == 94 and out[3]["util_pct"] == 76
+    assert out[3]["util3d_pct"] == 62
+    off = stats.GpuMonitor(reader=lambda: {"util_pct": 50, "temp_c": 1, "mem_used_mib": 1, "mem_total_mib": 2, "name": "x"},
+                           d3_reader=lambda: None, clock=lambda: 1.0, windows=True, start_thread=False)
+    off.sample3d()
+    assert "util3d_pct" not in off.read() and off.d3_ok is False
+
+
+def test_parse_typeperf_3d_sums_per_luid_and_hides_on_failure():
+    def col(luid, pid):
+        return rf'"\\PC\GPU Engine(pid_{pid}_luid_0x00000000_0x0000{luid}_phys_0_eng_0_engtype_3D)\Utilization Percentage"'
+    txt = '"(PDH-CSV 4.0)",' + ",".join([col("AAAA", 1), col("AAAA", 2), col("BBBB", 3)]) + chr(10)
+    txt += '"11/11/2026 10:00:00.000","40.5","20.5","5"' + chr(10)
+    assert stats.parse_typeperf_3d("Error: no counters") is None
+    assert stats.read_3d(runner=lambda *a, **k: (_ for _ in ()).throw(OSError())) is None
+    assert "3D" in plain(board.render_board(dict(sample_state(), gpu=dict(sample_state()["gpu"], util3d_pct=62))))

@@ -92,7 +92,8 @@ def render_board(s):
     since = s.get("since_label") or "this session"
     top = Layout(name="top", size=4)
     top.split_row(
-        Layout(_panel(_stat(_n(s["lines"]), "lines", f"▲ {_n(s['lines_hour'])} this hour", GREEN), "LINES TODAY")),
+        Layout(_panel(_stat(_n(s["lines"]), "lines", f"▲ {_n(s['lines_hour'])} this hour", GREEN),
+                      "LINES TODAY - 2 workers" if s.get("workers", 1) == 2 else "LINES TODAY")),
         Layout(_panel(_stat(_n(s["words"]), "words", f"{_n(s['words_hour'])} / hour"), "WORDS")),
         Layout(_panel(_stat(_n(s["audio_min"]), "min", f"made since {since}"), "AUDIO MINUTES")))
 
@@ -110,16 +111,21 @@ def render_board(s):
     gt = Text()
     if g:
         gt.append(f"{g.get('name', 'NVIDIA graphics card')}\n", style=PARCH)
-        gt.append("Load ")
+        gt.append("Utilisation ")
         gt.append_text(bar(g["util_pct"] / 100))
-        gt.append(f" {g['util_pct']}%\nTemp ")
+        gt.append(f" {g['util_pct']}%\n")
+        if g.get("util3d_pct") is not None:
+            gt.append("3D ")
+            gt.append_text(bar(g["util3d_pct"] / 100))
+            gt.append(f" {g['util3d_pct']}%\n")
+        gt.append("Temp ")
         gt.append_text(bar(g["temp_c"] / 100, colour=AMBER if g["temp_c"] >= 70 else GREEN))
         gt.append(f" {g['temp_c']} C\nVRAM ")
         gt.append_text(bar(g["mem_used_mib"] / max(1, g["mem_total_mib"])))
         gt.append(f" {g['mem_used_mib'] / 1024:.1f}/{g['mem_total_mib'] / 1024:.0f} GB")
     else:
         gt.append("No graphics card reading yet.", style=DIM)
-    mid = Layout(name="mid", size=6)
+    mid = Layout(name="mid", size=7 if g and g.get("util3d_pct") is not None else 6)
     mid.split_row(Layout(_panel(ql, "QUEUE / TIME LEFT")), Layout(_panel(gt, "GPU HEALTH")))
 
     now = Text()

@@ -150,8 +150,9 @@ def kill_pid_tree(pid):
 
 
 class WorkerRunner:
-    def __init__(self, install, popen=subprocess.Popen, clock=time.time, nice=False):
+    def __init__(self, install, popen=subprocess.Popen, clock=time.time, nice=False, index=1):
         self.install = Path(install)
+        self.index = index                  # 1 = the first worker; 2 = the second on the same card
         self.popen = popen
         self.clock = clock
         self.nice = nice                    # Linux: run at low priority (used when idle time cannot be read)
@@ -202,7 +203,11 @@ class WorkerRunner:
 
     @property
     def work_dir(self):
-        return self.install / "work"
+        return self.install / ("work" if self.index == 1 else f"work_{self.index}")
+
+    @property
+    def config_path(self):
+        return self.install / ("worker_config.json" if self.index == 1 else f"worker_config_{self.index}.json")
 
     @property
     def running(self):
@@ -214,7 +219,7 @@ class WorkerRunner:
 
     def command(self):
         return [str(self.python), str(self.install / "net_worker.py"), "run",
-                "--config", str(self.install / "worker_config.json")]
+                "--config", str(self.config_path)]
 
     def environment(self, base=None):
         e = dict(base if base is not None else os.environ)
@@ -292,3 +297,84 @@ class WorkerRunner:
                 on_wait()
             sleep(0.5)
         self.clear_stop()
+
+
+class WorkerGroup:
+    """One or two workers on the same card, driven as one. Same surface as WorkerRunner for the code that uses it.
+    Both are always known (so a leftover second worker is found and stopped after switching back to one);
+    only the first `count` are started."""
+
+    def __init__(self, install, count=1, **kw):
+        self.runners = [WorkerRunner(install, index=i, **kw) for i in (1, 2)]
+        self.count = 2 if count == 2 and self.runners[1].config_path.exists() else 1
+
+    @property
+    def active(self):
+        return self.runners[:self.count]
+
+    @property
+    def running(self):
+        return any(r.running for r in self.runners)
+
+    @property
+    def nice(self):
+        return self.runners[0].nice
+
+    @nice.setter
+    def nice(self, v):
+        for r in self.runners:
+            r.nice = v
+
+    @property
+    def stop_asked_at(self):
+        return self.runners[0].stop_asked_at
+
+    @stop_asked_at.setter
+    def stop_asked_at(self, v):
+        for r in self.runners:
+            r.stop_asked_at = v
+
+    def start(self):
+        return any([r.start() for r in self.active])
+
+    def request_stop(self):
+        for r in self.runners:
+            r.request_stop()
+
+    def poll_stop(self, grace=120):
+        return all([r.poll_stop(grace) for r in self.runners])
+
+    def stop_and_wait(self, grace=120, sleep=time.sleep, on_wait=None):
+        for r in self.runners:
+            r.request_stop()
+        while not self.poll_stop(grace):
+            if on_wait:
+                on_wait()
+            sleep(0.5)
+        for r in self.runners:
+            r.clear_stop()
+            r._drop_pid_file()
+        time.sleep(2)
+
+    def shutdown_fast(self, wait=4.0, sleep=time.sleep):
+        for r in self.runners:
+            r.request_stop()
+        end = self.runners[0].clock() + wait
+        while self.running and self.runners[0].clock() < end:
+            sleep(0.2)
+        for r in self.runners:
+            r.kill_tree()
+
+    def find_existing(self):
+        """{index: pid} of workers left running by an earlier copy of the app."""
+        found = {}
+        for r in self.runners:
+            pid = r.find_existing()
+            if pid:
+                found[r.index] = pid
+        return found
+
+    def adopt(self, found):
+        for r in self.runners:
+            if r.index in found:
+                r.adopt(found[r.index])

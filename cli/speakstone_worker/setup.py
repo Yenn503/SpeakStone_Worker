@@ -126,6 +126,18 @@ class Env:
         return self.install / "worker_config.json"
 
     @property
+    def work_dir_2(self):
+        return self.install / "work_2"
+
+    @property
+    def config_file_2(self):
+        return self.install / "worker_config_2.json"
+
+    @property
+    def enrolled_file_2(self):
+        return self.install / "enrolled_2.json"
+
+    @property
     def enrolled_file(self):
         return self.install / "enrolled.json"           # label / tier only, never the key
 
@@ -361,6 +373,42 @@ def step_enroll(env):
     env.enrolled_file.write_text(json.dumps({"worker_id": info.get("worker_id"), "label": info.get("label"),
                                              "tier": info.get("tier")}), encoding="utf-8")
     env.progress("enroll", 1, f"Joined the queue as {info.get('label') or 'a new worker'}")
+
+
+# Two workers on one card: each is an ordinary one-lease worker with its own key (the site limits a key to one lease,
+# so sharing a key would hand the second process the first one's job).
+MIN_TOTAL_MIB_FOR_TWO = 12000            # a "12 GB" card reports 12282-12288 MiB
+MIN_FREE_MIB_FOR_TWO = 10000             # about 5 GB for each process; "10 GB" cards report a little under 10240
+
+
+def second_worker_allowed(gpu):
+    """(ok, sentence). `gpu` is stats.gpu_reading()."""
+    if not gpu:
+        return False, "No NVIDIA graphics card was found."
+    if gpu.get("mem_total_mib", 0) < MIN_TOTAL_MIB_FOR_TWO:
+        return False, "Two workers need a graphics card with at least 12 GB of memory."
+    if gpu["mem_total_mib"] - gpu.get("mem_used_mib", 0) < MIN_FREE_MIB_FOR_TWO:
+        return False, "Two workers need about 10 GB of free graphics memory right now. Close other programs and try again."
+    return True, ""
+
+
+def enroll_second(env):
+    """Join the queue a second time as '<host>-2' and write worker_config_2.json. Kept if it already exists."""
+    if env.config_file_2.exists():
+        return
+    name = (env.machine_name or "worker") + "-2"
+    info = env.enroll(machine_name=name)
+    key = info["key"]
+    env.work_dir_2.mkdir(parents=True, exist_ok=True)
+    cmd = [env.py, env.install / "net_worker.py", "init", "--config", env.config_file_2,
+           "--model-dir", env.model_dir, "--work-dir", env.work_dir_2, "--machine-name", name]
+    if env.api_base:
+        cmd += ["--api-base", env.api_base]
+    _run(env, "enroll", cmd, extra_env={"SSW_WORKER_KEY": key}, cwd=env.install)
+    if not env.config_file_2.exists():
+        raise SetupError("The second worker key was not accepted by the worker. Please try again.")
+    env.enrolled_file_2.write_text(json.dumps({"worker_id": info.get("worker_id"), "label": info.get("label"),
+                                               "tier": info.get("tier")}), encoding="utf-8")
 
 
 def step_check(env):
