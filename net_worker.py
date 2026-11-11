@@ -37,7 +37,7 @@ from pathlib import Path
 
 # ----------------------------------------------------------------------------------------------- constants
 PROTOCOL = 1
-WORKER_VERSION = "1.0.0"
+WORKER_VERSION = "1.0.1"
 RECIPE = "idx2-v1"
 ENGINE = "indextts2"
 DEFAULT_API_BASE = "https://speakstone.beanw.co.uk"
@@ -98,6 +98,31 @@ class LeaseLost(Exception):
 
 class NetError(Exception):
     """Network failure or a transient server answer (5xx, 429): retried with backoff."""
+
+
+_ERR_LINE = re.compile(r"^\s*(?:[\w.]+\.)?\w*(?:Error|Exception)\b:\s.*$")
+_HOME_PATHS = re.compile(r"(?i)(?:[a-z]:\\users\\[^\\/\s'\"]+|/home/[^/\s'\"]+|/users/[^/\s'\"]+|/root)(?=[\\/\s'\"]|$)")
+
+
+def scrub_paths(text):
+    """home-folder paths become ~ before an error line leaves the machine."""
+    return _HOME_PATHS.sub("~", text)
+
+
+def last_error_line(log_path, offset=0, max_bytes=65536):
+    """The last exception-looking line written to log_path after offset, paths scrubbed, at most 160 chars; "" if none."""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            f.seek(max(offset, end - max_bytes))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    for line in reversed(text.splitlines()):
+        if _ERR_LINE.match(line):
+            return scrub_paths(line.strip())[:160]
+    return ""
 
 
 class JobFail(Exception):
@@ -258,7 +283,53 @@ def query_gpu():
         return dict(NULL_GPU)
 
 
-# ----------------------------------------------------------------------------------------------- config
+TELEMETRY_TTL = 30.0
+_TELEMETRY_QUERY = "temperature.gpu,memory.used,memory.total,utilization.gpu,power.draw"
+_telemetry_cache = {"t": None, "v": None}
+
+
+def _bounded(s, lo, hi, as_float=False):
+    try:
+        x = float(str(s).strip())
+    except (ValueError, TypeError):
+        return None
+    if x != x or x < lo or x > hi:
+        return None
+    return round(x, 1) if as_float else int(x)
+
+
+def parse_telemetry(text):
+    """One nvidia-smi csv line (first GPU) -> telemetry dict with only the keys that could be read; None when none."""
+    lines = (text or "").strip().splitlines()
+    if not lines:
+        return None
+    parts = [p.strip() for p in lines[0].split(",")]
+    if len(parts) < 5:
+        return None
+    out = {"gpu_temp_c": _bounded(parts[0], 0, 120), "gpu_mem_used_mib": _bounded(parts[1], 0, 10 ** 7),
+           "gpu_mem_total_mib": _bounded(parts[2], 0, 10 ** 7), "gpu_util_pct": _bounded(parts[3], 0, 100),
+           "gpu_power_w": _bounded(parts[4], 0, 10 ** 5, as_float=True)}
+    out = {k: v for k, v in out.items() if v is not None}
+    return out or None
+
+
+def read_telemetry(now=None, runner=subprocess.run, ttl=TELEMETRY_TTL):
+    """GPU telemetry for the heartbeat. One nvidia-smi call, cached for ttl seconds (failures too),
+    never raises, returns None when nothing could be read."""
+    now = time.monotonic() if now is None else now
+    if _telemetry_cache["t"] is not None and now - _telemetry_cache["t"] < ttl:
+        return _telemetry_cache["v"]
+    try:
+        r = runner(["nvidia-smi", f"--query-gpu={_TELEMETRY_QUERY}", "--format=csv,noheader,nounits"],
+                   capture_output=True, text=True, timeout=5)
+        v = parse_telemetry(r.stdout) if r.returncode == 0 else None
+    except Exception:
+        v = None
+    _telemetry_cache["t"], _telemetry_cache["v"] = now, v
+    return v
+
+
+# ----------------------------------------------------------------------------------------------- config (8.1)
 class Config:
     def __init__(self):
         self.path = None
@@ -329,7 +400,7 @@ def load_config(path=None, env=None, require_key=True):
     return c
 
 
-# ----------------------------------------------------------------------------------------------- model hash
+# ----------------------------------------------------------------------------------------------- model hash (8.2)
 def list_model_files(model_dir):
     """[relpath, size, mtime_ns] for every regular file, skipping dot paths and __pycache__, sorted by UTF-8 bytes."""
     out = []
@@ -761,6 +832,12 @@ class Heartbeat(threading.Thread):
         try:
             body = {"job_id": ctx.job_id, "lease_id": ctx.lease_id, "lines_done": ctx.lines_done(),
                     "live": w.live_fields(ctx)}
+            try:
+                tel = read_telemetry()
+                if tel:
+                    body["telemetry"] = tel
+            except Exception:
+                pass                                   # telemetry must never break a heartbeat
             status, _ = w.api.post("heartbeat", body)
             if status in (404, 409, 410):
                 ctx.lost_status = status
@@ -1158,6 +1235,7 @@ class Worker:
 
         t_run = time.time()
         runs = 0
+        last_err = ""
         while True:
             runs += 1
             self.log.event("run_start", ctx.job_id, run=runs, lines=ctx.n)
@@ -1166,10 +1244,14 @@ class Worker:
             rc = self.run_synth(ctx)
             st = self.scan(ctx)
             unsafe = self.log_has(log_path, offset, GPU_UNSAFE_MARKER)
+            err = last_error_line(log_path, offset) if rc else ""
+            if err:
+                last_err = err
+            extra = {"error": err} if err else {}
             self.log.event("run_end", ctx.job_id, run=runs, exit=rc,
                            ok=sum(1 for v in st.values() if v["kind"] == "ok"),
                            held=sum(1 for v in st.values() if v["kind"] == "held"),
-                           missing=sum(1 for v in st.values() if v["kind"] == "missing"))
+                           missing=sum(1 for v in st.values() if v["kind"] == "missing"), **extra)
             todo = [i for i, v in st.items() if v["kind"] == "missing" or (v["kind"] == "held" and not v["final"])]
             if not todo:
                 break
@@ -1180,7 +1262,10 @@ class Worker:
             ctx.check()
         missing = [i for i, v in st.items() if v["kind"] == "missing"]
         if missing:
-            raise JobFail("line_failed", f"{len(missing)} of {ctx.n} lines were not made", True, False)
+            msg = f"{len(missing)} of {ctx.n} lines were not made"
+            if last_err:
+                msg += f"; last error: {last_err}"
+            raise JobFail("line_failed", msg[:200], True, False)
 
         for upload_round in range(3):
             self.upload_all(ctx, st)
@@ -1255,6 +1340,9 @@ class Worker:
         env = dict(os.environ)
         env["INDEXTTS2_DIR"] = str(self.cfg.model_dir)
         env["PYTHONUNBUFFERED"] = "1"
+        # some cloud images turn hf_transfer on without installing it, which crashes
+        # IndexTTS-2's first-load model fetch on every run. Plain downloads work everywhere.
+        env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
         for k in ("IDX2_NUM_BEAMS", "IDX2_BEAMS_BY_EMOTION", "SSW_WORKER_KEY", "WORKER_KEY", "SSW_VERCEL_BYPASS"):
             env.pop(k, None)
         key = self.cfg.worker_key
