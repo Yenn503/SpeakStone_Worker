@@ -22,6 +22,8 @@ UV_URL = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-
 INDEX_TTS_URL = f"https://github.com/index-tts/index-tts/archive/{INDEX_TTS_COMMIT}.zip"
 FFMPEG_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
 TORCH_INDEX = "https://download.pytorch.org/whl/cu128"
+# v0.1.0's plain "torch torchaudio" reinstall pulled torch 2.11, which the voice engine does not run on.
+TORCH_PINS = ("torch==2.8.0+cu128", "torchaudio==2.8.0+cu128")
 MODEL_REPO = "IndexTeam/IndexTTS-2"
 WORKER_FILES = ("net_worker.py", "indextts2_worker.py", "runpod_worker.py")
 
@@ -38,7 +40,7 @@ LABELS = {
     "torch": "Installing the graphics-card libraries",
     "model": "Downloading the voice model (about 5.5 GB)",
     "ffmpeg": "Fetching audio tools",
-    "key": "Saving your worker key",
+    "key": "Joining the network",
     "check": "Final check",
 }
 
@@ -53,7 +55,8 @@ class Env:
     resource_dir: Path                                  # where the bundled net_worker.py etc. sit
     download: callable = None                           # (url, dest_path, progress(frac)) -> None
     run: callable = None                                # (cmd list, env dict, cwd, on_line) -> exit code
-    ask_key: callable = None                            # () -> str   (hidden input; may return "")
+    ask_key: callable = None                            # () -> str   (hidden input; may return "")  [tkinter app]
+    enroll: callable = None                             # () -> str   asks the site for this PC's own key  [CLI]
     gpu_total_mib: callable = None                      # () -> int | None
     progress: callable = field(default=lambda step, frac, msg: None)
     base_env: dict = field(default_factory=lambda: dict(os.environ))
@@ -240,7 +243,7 @@ def step_packages(env):
 
 
 def step_torch(env):
-    _run(env, "torch", [env.uv, "pip", "install", "--python", env.py, "--reinstall", "torch", "torchaudio",
+    _run(env, "torch", [env.uv, "pip", "install", "--python", env.py, "--reinstall", *TORCH_PINS,
                         "--index-url", TORCH_INDEX])
     _run(env, "torch", [env.uv, "pip", "install", "--python", env.py, "--upgrade", "omegaconf>=2.3", "protobuf<3.21"])
 
@@ -270,7 +273,8 @@ def step_key(env):
     cfg = env.install / "worker_config.json"
     if cfg.exists():
         return                                          # already initialised; key kept as is
-    key = env.ask_key()
+    # CLI: the site hands this PC its own key (auto-approved); tkinter app: the person typed one.
+    key = env.enroll() if env.enroll else env.ask_key()
     if not key:
         raise SetupError("A worker key is needed. Ask the owner for one.")
     # The key travels only in the child's environment. It is not in `cmd`, so no log line can contain it.
@@ -284,7 +288,8 @@ def step_key(env):
 def step_check(env):
     _run(env, "check", [env.py, "-c",
                         "import torch; assert torch.cuda.is_available(), 'no CUDA'; "
-                        "print('graphics card ready:', torch.cuda.get_device_name(0))"])
+                        "assert torch.__version__.startswith('2.8.0'), 'wrong torch ' + torch.__version__; "
+                        "print('graphics card ready:', torch.cuda.get_device_name(0), torch.__version__)"])
 
 
 FUNCS = {"gpu": step_gpu, "folders": step_folders, "worker_files": step_worker_files, "uv": step_uv,

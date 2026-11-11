@@ -43,7 +43,8 @@ def read_log_stats(log_dir, since=None, now=None, max_files=3):
     """Totals from the newest worker_*.log files. `since` (epoch) limits to this session."""
     now = now or time.time()
     out = {"lines": 0, "jobs": 0, "busy_seconds": 0.0, "making": False, "last_event": "", "last_event_at": 0,
-           "lines_per_hour": 0.0, "current_lines": 0, "errors": 0}
+           "lines_per_hour": 0.0, "current_lines": 0, "errors": 0,
+           "words": 0, "audio_seconds": 0.0, "completions": [], "recent": [], "current_job": "", "current_since": 0}
     files = sorted(Path(log_dir).glob("worker_*.log"))[-max_files:]
     events = []
     for f in files:
@@ -57,18 +58,34 @@ def read_log_stats(log_dir, since=None, now=None, max_files=3):
             pass
     first = events[0][0] if events else None
     for ts, ev, kv in events:
+        job = kv.get("job", "-")
         if ev == "complete":
-            out["lines"] += _int(kv.get("ok")) + _int(kv.get("held"))
+            n = _int(kv.get("ok")) + _int(kv.get("held"))
+            out["lines"] += n
             out["jobs"] += 1
             out["busy_seconds"] += float(kv.get("seconds") or 0)
-        if ev == "error":
+            out["words"] += _int(kv.get("words"))                  # present once the worker logs it
+            out["audio_seconds"] += float(kv.get("audio") or 0)
+            out["completions"].append((ts, n))
+            out["recent"].append((ts, "ok", f"job {job[:6]} done - {n} lines"))
+        elif ev == "error":
             out["errors"] += 1
+            out["recent"].append((ts, "warn", "a problem was handled; the worker carries on"))
+        elif ev == "fail":
+            out["recent"].append((ts, "warn", f"job {job[:6]} handed back"))
+        elif ev == "lease_lost":
+            out["recent"].append((ts, "warn", f"job {job[:6]} was taken back by the site"))
         if ev in MAKING_EVENTS:
             out["making"] = True
             out["current_lines"] = _int(kv.get("lines"))
+            if ev == "claim" or not out["current_job"]:
+                out["current_job"], out["current_since"] = job, ts
+            if ev in ("claim", "resume"):
+                out["recent"].append((ts, "info", f"job {job[:6]} started - {out['current_lines']} lines"))
         elif ev in DONE_EVENTS:
             out["making"] = False
             out["current_lines"] = 0
+            out["current_job"] = ""
         out["last_event"], out["last_event_at"] = ev, ts
     if out["making"] and now - out["last_event_at"] > 3 * 3600:
         out["making"] = False           # a job cannot run longer than the 3 h lease cap
@@ -88,6 +105,39 @@ def gpu_reading(runner=subprocess.run):
         return {"temp_c": t, "util_pct": u, "mem_used_mib": mu, "mem_total_mib": mt}
     except Exception:
         return None
+
+
+def gpu_info(runner=subprocess.run):
+    """(name, total MiB) of the first GPU, or (None, None)."""
+    try:
+        r = runner(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                   capture_output=True, text=True, timeout=5)
+        name, mib = [x.strip() for x in r.stdout.strip().splitlines()[0].split(",")[:2]]
+        return name[:64], int(float(mib))
+    except Exception:
+        return None, None
+
+
+BARS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+
+
+def sparkline(values):
+    """Unicode bars scaled to the largest value; all zeros gives the lowest bar."""
+    values = list(values)
+    top = max(values) if values else 0
+    if top <= 0:
+        return BARS[0] * len(values)
+    return "".join(BARS[min(7, int(v / top * 7.999))] for v in values)
+
+
+def speed_series(completions, now, buckets=15, bucket_seconds=240):
+    """Lines finished in each of the last `buckets` slices (oldest first): an hour at the defaults."""
+    out = [0] * buckets
+    for ts, n in completions:
+        age = int((now - ts) // bucket_seconds)
+        if 0 <= age < buckets:
+            out[buckets - 1 - age] += n
+    return out
 
 
 def gpu_total_mib(runner=subprocess.run):
@@ -124,6 +174,7 @@ def snapshot(work_dir, api_base, since=None, now=None, gpu=gpu_reading, queue=fe
     now = now or time.time()
     s = read_log_stats(Path(work_dir) / "logs", since=since, now=now)
     s["gpu"] = gpu()
+    s["speed"] = speed_series(s["completions"], now)
     q = queue(api_base)
     s["queue"] = q
     # time left: the site's own estimate (all workers); ours alone when the site gives none
