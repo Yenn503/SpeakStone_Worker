@@ -730,12 +730,11 @@ def fake_hf_cache(install, complete=True):
 
 def test_extras_cached_and_offline_env(tmp_path):
     from speakstone_worker.runner import WorkerRunner
-    e = WorkerRunner(tmp_path).environment({"HF_HUB_OFFLINE": "1"})
-    assert setup.extras_cached(tmp_path) is False and "HF_HUB_OFFLINE" not in e      # cache empty: must be allowed to fetch
+    assert setup.extras_cached(tmp_path) is False
     fake_hf_cache(tmp_path)
     assert setup.extras_cached(tmp_path) is True
     e = WorkerRunner(tmp_path).environment({})
-    assert e["HF_HOME"] == str(tmp_path / "hf") and e["HF_HUB_OFFLINE"] == "1" and e["TRANSFORMERS_OFFLINE"] == "1"
+    assert e["HF_HOME"] == str(tmp_path / "hf") and "HF_HUB_OFFLINE" not in e
     # both workers get the same cache and the same model folder
     assert WorkerRunner(tmp_path, index=2).environment({})["HF_HOME"] == e["HF_HOME"]
     assert WorkerRunner(tmp_path, index=2).environment({})["INDEXTTS2_DIR"] == e["INDEXTTS2_DIR"]
@@ -760,7 +759,7 @@ def test_synth_env_keeps_hf_home_and_offline():
     finally:
         for k, v in old.items():
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
-    assert env["HF_HOME"] == "C:/inst/hf" and env["HF_HUB_OFFLINE"] == "1" and env["TRANSFORMERS_OFFLINE"] == "1"
+    assert env["HF_HOME"] == "C:/inst/hf" and "HF_HUB_OFFLINE" not in env
 
 
 def test_forget_extras_then_setup_state(tmp_path):
@@ -799,27 +798,18 @@ def _worker_obj():
     return net_worker, w
 
 
-def test_offline_miss_patterns_and_online_retry_env(tmp_path, monkeypatch):
+def test_never_offline_and_hf_urls_stay_readable(tmp_path, monkeypatch):
     nw, w = _worker_obj()
-    for text in ("huggingface_hub.errors.LocalEntryNotFoundError: Cannot find an appropriate cached snapshot folder",
-                 "OSError: We couldn't connect to 'https://huggingface.co' to load this file",
-                 "Cannot find the requested files in the disk cache and outgoing traffic has been disabled",
-                 "Offline mode is enabled"):
-        assert nw.OFFLINE_MISS.search(text), text
-    assert not nw.OFFLINE_MISS.search("CUDA out of memory")
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
-    w.force_online = False
-    assert w.synth_env()["HF_HUB_OFFLINE"] == "1"
-    w.force_online = True
+    monkeypatch.setenv("HF_HOME", "C:/inst/hf")
     e = w.synth_env()
-    assert "HF_HUB_OFFLINE" not in e and "TRANSFORMERS_OFFLINE" not in e
-    w.work = tmp_path
-    w.note_offline_miss("LocalEntryNotFoundError: campplus_cn_common.bin")
-    assert "campplus_cn_common.bin" in (tmp_path / "offline_misses.txt").read_text()
-    log = tmp_path / "worker.log"
-    log.write_bytes(b"old\nnew LocalEntryNotFoundError here")
-    assert "LocalEntryNotFoundError" in w.log_tail(log, 4) and "old" not in w.log_tail(log, 4)
+    assert "HF_HUB_OFFLINE" not in e and "TRANSFORMERS_OFFLINE" not in e and e["HF_HOME"] == "C:/inst/hf"
+    log = nw.Log(tmp_path, key="", echo=False)
+    msg = "We couldn't connect to 'https://huggingface.co/funasr/campplus/resolve/main/x.bin' and https://evil.example/a"
+    assert "huggingface.co/funasr/campplus" in log._clean(msg) and "evil.example" not in log._clean(msg)
+    from speakstone_worker.runner import WorkerRunner
+    assert "HF_HUB_OFFLINE" not in WorkerRunner(tmp_path).environment({"HF_HUB_OFFLINE": "1"})
 
 
 def test_sync_worker_files_replaces_stale_install_copy(tmp_path):
@@ -841,4 +831,4 @@ def test_run_end_error_shows_in_recent_events():
           (now - 2, "offline_retry", {"job": "abcdef123456", "error": "LocalEntryNotFoundError"})]
     s = stats.summarize(ev, now)
     texts = " ".join(e[2] + " " + e[3] for e in s["events"])
-    assert "OSError: campplus_cn_common.bin missing" in texts and "fetching a missing file" in texts
+    assert "OSError: campplus_cn_common.bin missing" in texts

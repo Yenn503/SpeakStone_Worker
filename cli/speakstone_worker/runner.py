@@ -228,13 +228,8 @@ class WorkerRunner:
         e["INDEXTTS2_DIR"] = str(self.install / "IndexTTS-2")
         e["HF_HOME"] = str(self.install / "hf")      # ONE cache for every worker, where setup pre-fetched the files
         e["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-        from . import setup as _setup
-        if _setup.extras_cached(self.install):         # nothing is fetched per job; a missing file fails, not downloads
-            e["HF_HUB_OFFLINE"] = "1"
-            e["TRANSFORMERS_OFFLINE"] = "1"
-        else:
-            e.pop("HF_HUB_OFFLINE", None)
-            e.pop("TRANSFORMERS_OFFLINE", None)
+        e.pop("HF_HUB_OFFLINE", None)                  # never offline: a missing file is fetched, a cached one only checked
+        e.pop("TRANSFORMERS_OFFLINE", None)
         e["PYTHONUNBUFFERED"] = "1"
         e.pop("SSW_WORKER_KEY", None)       # the key comes from the worker's own config file
         return e
