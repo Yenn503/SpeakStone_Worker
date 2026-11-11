@@ -78,7 +78,7 @@ def run_setup_ui(console, install, base):
     def do_enroll():
         gpu = stats.gpu_reading() or {}
         return enroll_mod.enroll(api, host, gpu.get("name", "unknown"), gpu.get("mem_total_mib", 0),
-                                 f"{platform.system()} {platform.release()}", worker_version(install))
+                                 ("windows" if platform.system() == "Windows" else "linux"), worker_version(install))
 
     env = setup.Env(install, paths.resource_dir(), download=download, run=setup.real_run, enroll=do_enroll,
                     gpu_total_mib=stats.gpu_total_mib, progress=progress, api_base=(api if os.environ.get("SPEAKSTONE_API_BASE") else ""),
