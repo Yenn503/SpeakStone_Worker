@@ -11,7 +11,8 @@ format indextts2_worker.py already reads, runs indextts2_worker.py UNCHANGED as 
 presigned URLs and posts the result manifest. Python >= 3.10, standard library only. It imports no torch / numpy.
 
 Privacy: the worker key is never logged or printed (sswk_ + last 4 only); the text of a line is never logged.
-Exit codes: 0 stopped, 2 config error, 3 key refused (401), 4 protocol refused (426), 5 model dir missing.
+Exit codes: 0 stopped, 2 config error, 3 key refused (401), 4 protocol refused (426), 5 model dir missing,
+6 another worker is already running with this key (config file) on this PC.
 """
 from __future__ import annotations
 
@@ -86,6 +87,8 @@ LIVE_KEYS = ("gpu_util", "gpu_mem_used_mib", "vram_free_mib", "session_started_a
              "session_audio_sec", "session_words", "words_per_hour", "audio_sec_per_hour")
 
 EXIT_OK, EXIT_CONFIG, EXIT_KEY, EXIT_PROTOCOL, EXIT_MODEL = 0, 2, 3, 4, 5
+EXIT_BUSY = 6                           # another worker holds this config's lock (one worker per key on a PC)
+BUSY_MESSAGE = "Another SpeakStone Worker is already running with this key on this PC"
 DRAIN_FILE = "STOP_AFTER_JOB"           # finish the job in hand, claim no more, exit (see Worker.drain_requested)
 
 
@@ -690,6 +693,71 @@ def lock_held(path):
         return False
     pid = text[-1] if text and text[-1].isdigit() else None
     return _pid_alive(pid) if pid else age < 3 * 3600
+
+
+class InstanceLock:
+    """One worker per config file (so one per key) on a PC. An exclusive, non-blocking OS lock on a file beside the
+    config, held for the whole life of the process. The operating system drops it when the process ends, even in a
+    crash, so it can never be left stuck. The first byte is the locked one; the pid is written after it for the message.
+    (cli/speakstone_worker/locking.py reads the same lock from the app side: keep the two in step.)"""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.fh = None
+
+    def acquire(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            open(self.path, "ab").close()
+            fh = open(self.path, "r+b")
+        except OSError:
+            return True                             # cannot even open the file: do not stop the worker for that
+        try:
+            fh.seek(0)
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        try:
+            fh.seek(0)
+            fh.write(b"L" + f"{os.getpid():>12}".encode() + b"\n")      # fixed width: nothing stale is left over
+            fh.flush()
+        except OSError:
+            pass
+        self.fh = fh
+        return True
+
+    def holder_pid(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(1)                                   # byte 0 is the locked one
+                return int(f.read(20).split()[0])
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def release(self):
+        fh, self.fh = self.fh, None
+        if fh is None:
+            return
+        try:
+            fh.seek(0)
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            fh.close()
+        except OSError:
+            pass
 
 
 class Api:
@@ -1411,7 +1479,23 @@ class Worker:
             self.sleep(VRAM_POLL_SECONDS)
 
     # ---- main loop
+    def lock_path(self):
+        p = getattr(self.cfg, "path", None)
+        return Path(str(p) + ".lock") if p else self.work / "worker.lock"
+
     def run(self):
+        self.instance_lock = InstanceLock(self.lock_path())
+        if not self.instance_lock.acquire():
+            self.log.event("stop", None, reason="another worker is running with this key", code=EXIT_BUSY,
+                           pid=self.instance_lock.holder_pid())
+            print(BUSY_MESSAGE, file=sys.stderr)
+            return EXIT_BUSY
+        try:
+            return self._run_locked()
+        finally:
+            self.instance_lock.release()
+
+    def _run_locked(self):
         old = {}
         if self.install_signals and threading.current_thread() is threading.main_thread():
             for name in ("SIGINT", "SIGBREAK", "SIGTERM"):

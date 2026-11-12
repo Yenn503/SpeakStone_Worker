@@ -108,3 +108,68 @@ def describe(install):
         tier = str(info.get("tier") or "")
         return f"{label} ({tier})" if tier else label
     return "(could not ask the site yet)" if read_key(install) else "(not set up yet - choose Start now)"
+
+
+# ---- renaming the worker (the owner types a name in Settings)
+import re  # noqa: E402
+import urllib.error  # noqa: E402
+
+NAME_RE = re.compile(r"^[A-Za-z0-9 _'.\-]{2,32}$")
+
+
+def check_name(text):
+    """-> (name, "") or (None, why). Trimmed; 2-32 characters of letters, digits, space, - _ ' ."""
+    name = (text or "").strip()
+    if not NAME_RE.match(name):
+        return None, "A name is 2 to 32 characters: letters, digits, spaces, - _ ' and . only."
+    return name, ""
+
+
+def _error_text(err):
+    try:
+        data = json.loads(err.read(10_000).decode("utf-8"))
+        msg = data.get("message") if isinstance(data, dict) else None
+        return msg.strip()[:200] if isinstance(msg, str) and msg.strip() else ""
+    except Exception:
+        return ""
+
+
+def rename(install, base, name, opener=urllib.request.urlopen, timeout=10.0, now=None):
+    """POST the new label. -> (True, "Renamed to X") or (False, sentence in plain words). Never includes the key."""
+    name, why = check_name(name)
+    if not name:
+        return False, why
+    key = read_key(install)
+    if not key:
+        return False, "This PC is not set up yet - choose Start now first."
+    req = urllib.request.Request(base.rstrip("/") + "/api/worker/me", method="POST",
+                                 data=json.dumps({"label": name}).encode("utf-8"),
+                                 headers={"Authorization": f"Bearer {key}", "Accept": "application/json",
+                                          "Content-Type": "application/json",
+                                          "User-Agent": f"speakstone-worker-cli/{__version__}",
+                                          "X-Worker-Protocol": "1"})
+    try:
+        with opener(req, timeout=timeout) as r:
+            status = getattr(r, "status", 200)
+            data = json.loads(r.read(100_000).decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 405):
+            return False, "The site cannot rename workers yet. Try again after the next site update."
+        if e.code == 409:
+            return False, "That name is taken. Pick another."
+        if e.code in (400, 422):
+            return False, _error_text(e) or "The site did not accept that name."
+        return False, "The site did not accept that name."
+    except Exception:
+        return False, "Could not reach the site."
+    if status != 200:
+        return False, "The site did not accept that name."
+    if isinstance(data, dict) and isinstance(data.get("worker"), dict):
+        data = data["worker"]
+    label = data.get("label") if isinstance(data, dict) else None
+    if not isinstance(label, str) or not label.strip():
+        return False, "The site's answer was not understood."
+    tier = data.get("tier")
+    save(install, {"label": label.strip()[:80], "tier": tier if isinstance(tier, str) else ""},
+         time.time() if now is None else now)
+    return True, f"Renamed to {label.strip()[:80]}"

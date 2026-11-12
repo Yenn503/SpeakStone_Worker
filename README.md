@@ -81,4 +81,4 @@ one it expects.
 - Privacy: the worker key is never logged or printed (only `sswk_` plus the last four characters). The text of a
   line is never logged. Nothing else on your machine is read or uploaded.
 
-Exit codes: 0 stopped, 2 config error, 3 key refused, 4 protocol refused, 5 model folder missing.
+Exit codes: 0 stopped, 2 config error, 3 key refused, 4 protocol refused, 5 model folder missing, 6 another worker is already running with this key (config file) on this PC.

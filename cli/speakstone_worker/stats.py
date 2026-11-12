@@ -76,9 +76,10 @@ def summarize(events, now, avg_job_seconds_default=60.0):
     day0 = local_midnight(now)
     out = {"lines": 0, "words": 0, "audio_min": 0.0, "lines_hour": 0, "words_hour": 0.0, "first_today": None,
            "making": False, "job": None, "job_lines": 0, "job_started": 0.0, "avg_job_seconds": avg_job_seconds_default,
-           "events": [], "spark": [0.0] * BUCKETS, "errors": 0}
+           "events": [], "spark": [0.0] * BUCKETS, "errors": 0, "dl_today": 0, "dl_job": 0}
     buckets = [0.0] * BUCKETS
     seconds = []
+    dl_by_job = {}                                  # bytes the worker itself fetched, per job
     for ts, ev, kv in events:
         job = kv.get("job", "-")
         if ev == "complete":
@@ -103,7 +104,7 @@ def summarize(events, now, avg_job_seconds_default=60.0):
             if ev != "run_start":
                 out["job"], out["job_lines"], out["job_started"] = job, _int(kv.get("lines")), ts
                 if ev == "resume":
-                    out["events"].append((ts, "retry", f"job {job[:8]}", "picked up again"))
+                    out["events"].append((ts, "resumed", f"job {job[:8]}", "after a restart"))
             out["making"] = True
         elif ev == "run_end" and kv.get("error"):
             out["events"].append((ts, "error", f"job {job[:8]} - {kv['error']}", ""))
@@ -112,7 +113,13 @@ def summarize(events, now, avg_job_seconds_default=60.0):
             out["events"].append((ts, "retry", f"job {job[:8]} - given back", kv.get("reason", "")))
         elif ev == "lease_lost":
             out["making"] = False
-            out["events"].append((ts, "retry", f"job {job[:8]}", "picked up again"))
+            out["events"].append((ts, "dropped", f"job {job[:8]}", "the queue gave it to someone else"))
+        elif ev == "ref_fetch":
+            n = _int(kv.get("bytes"))
+            if n:
+                dl_by_job[job] = dl_by_job.get(job, 0) + n
+                if ts >= day0:
+                    out["dl_today"] += n
         elif ev == "error":
             out["errors"] += 1
             out["events"].append((ts, "error", kv.get("where", "worker"), "will retry"))
@@ -123,6 +130,7 @@ def summarize(events, now, avg_job_seconds_default=60.0):
     if seconds:
         out["avg_job_seconds"] = sum(seconds[-10:]) / len(seconds[-10:])
     out["spark"] = buckets
+    out["dl_job"] = dl_by_job.get(out["job"], 0)
     out["events"] = out["events"][-8:][::-1]
     out["audio_min"] = round(out["audio_min"])
     return out
@@ -284,71 +292,6 @@ class GpuMonitor:
         return g
 
 
-# ---------------------------------------------------------------- bytes received (so a download storm is visible)
-def parse_netstat_in(text):
-    """`netstat -e` -> bytes received, whatever the language: the first line that is a label followed by two numbers."""
-    for ln in text.splitlines():
-        parts = ln.split()
-        nums = [p for p in parts[1:] if p.isdigit()]
-        if len(parts) == 3 and not parts[0].isdigit() and len(nums) == 2:
-            return int(nums[0])
-    return None
-
-
-def read_net_in(runner=subprocess.run):
-    """Bytes received by this PC (all adapters). A machine-wide figure: Windows has no cheap per-process network counter."""
-    try:
-        if sys.platform == "win32":
-            r = runner(["netstat", "-e"], capture_output=True, text=True, timeout=5, creationflags=0x08000000)
-            return parse_netstat_in(r.stdout)
-        total = 0
-        with open("/proc/net/dev", encoding="utf-8") as f:
-            for ln in list(f)[2:]:
-                name, _, rest = ln.partition(":")
-                if name.strip() != "lo":
-                    total += int(rest.split()[0])
-        return total
-    except Exception:
-        return None
-
-
-class NetMeter:
-    """MB received this job and this session, from the sum of per-sample increases (so a counter that wraps at 4 GB or
-    resets when an adapter changes never makes the figure negative). The job figure restarts when the job id changes."""
-    WRAP = 2 ** 32
-
-    def __init__(self, reader=None, start_thread=True):
-        self.reader = reader or read_net_in
-        self.prev = None
-        self.total = 0
-        self.job = None
-        self.job_base = 0
-        self.seen = False
-        if start_thread:
-            threading.Thread(target=self._loop, daemon=True).start()
-
-    def _loop(self):
-        while True:
-            self.sample()
-            time.sleep(3)
-
-    def sample(self):
-        v = self.reader()
-        if v is None:
-            return
-        if self.prev is not None:
-            if v >= self.prev:
-                self.total += v - self.prev
-            elif self.prev > self.WRAP - 2 ** 28:       # near the top of a 32-bit counter: it wrapped
-                self.total += self.WRAP - self.prev + v
-            else:                                         # reset (adapter change): count what came in since
-                self.total += v
-        self.prev, self.seen = v, True
-
-    def figures(self, job):
-        """(job_mb, session_mb) or None before the first reading."""
-        if not self.seen:
-            return None
-        if job != self.job:
-            self.job, self.job_base = job, self.total
-        return ((self.total - self.job_base) / 1e6, self.total / 1e6)
+def download_figures(s):
+    """(this job MB, today MB) of the worker's OWN downloads (voice sample clips it logged), from a summary."""
+    return (s.get("dl_job", 0) / 1e6, s.get("dl_today", 0) / 1e6)

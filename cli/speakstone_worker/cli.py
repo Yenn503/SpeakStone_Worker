@@ -102,9 +102,10 @@ def worker_label(install):
     return identity.label_of(install)
 
 
-def ask_site_for_label(install, wait=identity.TIMEOUT, opener=None):
+def ask_site_for_label(install, wait=identity.TIMEOUT, opener=None, force=False):
     """Fill in the label from the site when it is unknown or a day old; never longer than `wait` seconds, silent."""
     kw = {"opener": opener} if opener else {}
+    kw["force"] = force
     t = threading.Thread(target=lambda: identity.refresh(install, paths.api_base(), **kw), daemon=True)
     t.start()
     t.join(wait)
@@ -231,7 +232,7 @@ class Collector:
         self._stop = True
 
 
-def board_state(install, queue, gpu, state, started, now=None, events=None, workers=1, net=None, update_version=None,
+def board_state(install, queue, gpu, state, started, now=None, events=None, workers=1, update_version=None,
                 label=""):
     now = now or time.time()
     if events is not None:
@@ -240,7 +241,7 @@ def board_state(install, queue, gpu, state, started, now=None, events=None, work
         dirs = [install / "work" / "logs"] + ([install / "work_2" / "logs"] if workers == 2 else [])
         s = stats.merge_summaries([stats.summarize(stats.read_events(d), now) for d in dirs])
     s["workers"] = workers
-    s["net"] = net.figures(s.get("job")) if net else None
+    s["net"] = stats.download_figures(s)
     s["queue"], s["gpu"], s["state"], s["update"], s["label"] = queue, gpu, state, update_version, label
     s["time_left"] = stats.time_left(queue, s["words_hour"], s["lines_hour"])
     s["since_label"] = time.strftime("%H:%M", time.localtime(s["first_today"] or started))
@@ -275,20 +276,26 @@ def start_now(console, install, settings, flow=None):
         flow.args = ["--start"]                      # an update while working restarts straight into making lines
     col = Collector(install, paths.api_base(), started)
     install_close_handlers(runner.shutdown_fast)
-    if not old:
+    watching = False
+    if not old and runner.busy_elsewhere():          # a worker with this key already runs (another window or the service)
+        watching = True
+    if not old and not watching:
         runner.start()
     result = "menu"
     try:
         with KeyReader() as keys, Live(console=console, screen=VT["on"], auto_refresh=False) as live:
             last_gpu, gpu, last_draw, last_view, last_size = 0, None, 0, None, console.size
-            monitor, net = stats.GpuMonitor(), stats.NetMeter()
+            monitor = stats.GpuMonitor()
             while True:
                 if time.time() - last_gpu > 2:
                     gpu, last_gpu = monitor.read(), time.time()
-                state = "paused" if paused else ("stopped" if not runner.running else "idle")
-                view = board_state(install, col.queue, gpu, state, started, workers=runner.count, net=net,
+                state = "paused" if paused else ("stopped" if not runner.running and not watching else "idle")
+                view = board_state(install, col.queue, gpu, state, started, workers=runner.count,
                                    update_version=flow.version if flow else None, label=worker_label(install))
                 view["pause_choice"] = choosing
+                view["watching"] = watching
+                if state == "stopped" and _group_exit_code(runner) == 6:
+                    view["stop_note"] = BUSY_SENTENCE
                 view["paused_until"] = control_mod.until_label(paused_until) if paused and paused_until else None
                 # Redraw only every 5 s or when something changed: a 4/s full-screen redraw flickered (owner 2026-11-11).
                 resized = console.size != last_size
@@ -296,11 +303,20 @@ def start_now(console, install, settings, flow=None):
                     live.update(board.render_board(view), refresh=True)
                     last_draw, last_view, last_size = time.time(), view, console.size
                 k = keys.poll(1.0)
-                if flow and not paused:
+                if flow and not paused and not watching:
                     update_step(flow, ctl, settings, runner)       # a swap restarts with --start and does not return
                 if paused and paused_until and time.time() >= paused_until:      # a timed pause ends by itself
                     paused, paused_until = False, None
                     runner.start()
+                if watching:
+                    if k == "s":                                              # stop the OTHER worker through its STOP file
+                        runner.stop_foreign()
+                        console.print("Asked the other worker to stop; it hands its job back.")
+                        result = "menu"
+                        break
+                    if k == "m":
+                        break
+                    k = None
                 if choosing and k:
                     choosing = False
                     minutes = board.PAUSE_KEYS.get(k)
@@ -332,7 +348,7 @@ def start_now(console, install, settings, flow=None):
 
 # ---------------------------------------------------------------- settings
 def settings_menu(console, install, st):
-    ask_site_for_label(install)
+    ask_site_for_label(install, force=True)          # a rename on the site shows at once
     while True:
         fresh_screen(console)
         console.print(f"\n[{board.GOLD}]SETTINGS[/]")
@@ -369,13 +385,27 @@ def settings_menu(console, install, st):
             console.print("Service removed." if service.uninstall() else "No service was installed.")
             time.sleep(1.5)
         elif k == "4":
-            console.print(f"Worker label: {identity.describe(install)}")
-            time.sleep(2)
+            console.print(rename_flow(console, install))
+            time.sleep(2.5)
         elif k == "5":
             console.print(set_workers(console, install, st))
             time.sleep(2)
         elif k in ("b", "q", "\x1b"):
             return
+
+
+def rename_flow(console, install, ask=input, renamer=identity.rename):
+    """Settings > 4: show the label, ask for a new one, send it to the site. Returns the sentence to show."""
+    console.print(f"Worker label: {identity.describe(install)}")
+    console.show_cursor(True)
+    text = ask("New name (Enter to keep): ").strip()
+    if not text:
+        return "Kept the current name."
+    name, why = identity.check_name(text)
+    if not name:
+        return why
+    ok, msg = renamer(install, paths.api_base(), name)
+    return msg
 
 
 def stop_all_workers(install, wait=8.0):
@@ -452,10 +482,13 @@ def hide_console():
 
 
 # Exit codes the worker uses when restarting cannot help (key refused and the like): wait long, then try once more.
-NO_RESTART_CODES = (3, 4, 5)
+NO_RESTART_CODES = (3, 4, 5, 6)
 NO_RESTART_WAIT = 30 * 60
 CRASH_BACKOFF_FIRST = 30
 CRASH_BACKOFF_MAX = 10 * 60
+
+
+BUSY_SENTENCE = "Another SpeakStone Worker is already running with this key on this PC."
 
 
 class RestartGate:
@@ -534,6 +567,10 @@ def background_tick(runner, st, now=None, readers=None, gate=None, control=None)
         gate.observe(runner.running, 0 if runner.stop_asked_at or runner.running else _group_exit_code(runner))
         if action == "start" and gate.blocked():
             action = "wait"
+    if action == "start":
+        busy = getattr(runner, "busy_elsewhere", None)
+        if busy is not None and busy():
+            action = "wait"                    # a worker with this key already runs (another window): never start a second
     if action == "start" and control is not None and control.drain_reason == "update":
         action = "wait"                        # the worker left so the update can go in: do not start another
     if action == "start":

@@ -6,6 +6,8 @@ import sys
 import time
 from pathlib import Path
 
+from . import locking
+
 
 # ---------------------------------------------------------------- tie the worker's life to ours
 _KEEP_JOB = []                              # the one job object, kept open for the life of the app
@@ -270,6 +272,22 @@ class WorkerRunner:
                 pass
         return True
 
+    @property
+    def lock_path(self):
+        return self.config_path.with_name(self.config_path.name + ".lock")
+
+    def busy_elsewhere(self):
+        """True when a worker with this config's key runs that this app did not start (another window, the service)."""
+        return not self.running and locking.is_locked(self.lock_path)
+
+    def stop_foreign(self):
+        """Ask a worker we do not own to stop: its STOP file (it hands its job back)."""
+        try:
+            self.work_dir.mkdir(parents=True, exist_ok=True)
+            (self.work_dir / "STOP").write_text("stop", encoding="utf-8")
+        except OSError:
+            pass
+
     def request_drain(self):
         """Ask the worker to finish its job and leave. Nothing is handed back and nothing is killed."""
         if not self.running:
@@ -369,6 +387,14 @@ class WorkerGroup:
     def request_stop(self):
         for r in self.runners:
             r.request_stop()
+
+    def busy_elsewhere(self):
+        return any(r.busy_elsewhere() for r in self.active)
+
+    def stop_foreign(self):
+        for r in self.active:
+            if r.busy_elsewhere():
+                r.stop_foreign()
 
     def request_drain(self):
         for r in self.runners:

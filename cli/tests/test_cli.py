@@ -1041,26 +1041,6 @@ def test_forget_extras_then_setup_state(tmp_path):
     assert json.loads((tmp_path / "setup_state.json").read_text())["done"] == ["model"]
 
 
-def test_parse_netstat_and_net_meter():
-    txt = ("Interface Statistics\n\n                           Received            Sent\n\n"
-           "Bytes                 123456789        98765432\nUnicast packets          1000            900\n")
-    assert stats.parse_netstat_in(txt) == 123456789
-    assert stats.parse_netstat_in("Bytes empfangen") is None
-    seq = iter([1_000_000, 3_000_000, 9_000_000])
-    m = stats.NetMeter(reader=lambda: next(seq), start_thread=False)
-    assert m.figures("j") is None
-    m.sample()
-    assert m.figures("j1") == (0.0, 0.0)
-    m.sample()
-    assert m.figures("j1") == (2.0, 2.0)
-    m.sample()
-    assert m.figures("j2") == (0.0, 8.0)                       # new job restarts the job figure only
-    s = sample_state()
-    s["net"] = (1.5, 8.0)
-    assert "Download: 2 MB this job / 8 MB session" in plain(board.render_board(s), width=120)
-
-
-# ------------------------------------------------------------------ self-heal and visibility
 def _worker_obj():
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     import net_worker
@@ -1105,21 +1085,6 @@ def test_run_end_error_shows_in_recent_events():
     s = stats.summarize(ev, now)
     texts = " ".join(e[2] + " " + e[3] for e in s["events"])
     assert "OSError: campplus_cn_common.bin missing" in texts
-
-
-def test_net_meter_survives_wrap_and_reset_never_negative():
-    top = 2 ** 32
-    seq = iter([top - 1_000_000, 500_000, 2_500_000, 100_000, 1_100_000])   # wrap, grow, reset, grow
-    m = stats.NetMeter(reader=lambda: next(seq), start_thread=False)
-    m.sample()
-    assert m.figures("j") == (0.0, 0.0)
-    m.sample()                                   # wrapped: 1.5 MB
-    assert m.figures("j")[1] == pytest.approx(1.5)
-    m.sample()                                   # +2.0 MB
-    m.sample()                                   # reset to a low value: only the 0.1 MB since the reset
-    m.sample()                                   # +1.0 MB
-    job, session = m.figures("j")
-    assert session == pytest.approx(4.6) and job == pytest.approx(4.6) and job >= 0
 
 
 # ---- model cache folder (every job fetched the extra model files again, 2026-11-12) ----

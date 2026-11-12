@@ -142,7 +142,7 @@ def make_worker(tmp_path, monkeypatch, api=None, mode="", keep=True, gpu=None):
     cfg = nw.Config()
     cfg.work_dir = (tmp_path / "work").resolve()
     cfg.worker_key = ""
-    cfg.model_dir = str(tmp_path)
+    cfg.model_dir = str(tmp_path / "model") if (tmp_path / "model" / "config.yaml").exists() else str(tmp_path)
     cfg.python = sys.executable
     cfg.synth_script = str(script)
     cfg.need_free_mib = 0
@@ -582,7 +582,8 @@ def test_run_batch_does_not_depend_on_cwd(tmp_path, monkeypatch):
 
 # ------------------------------------------------------------------ 9. drain: finish the job in hand, claim nothing new
 def _ready(tmp_path):
-    (tmp_path / "config.yaml").write_text("x")             # startup() wants a model folder that looks complete
+    (tmp_path / "model").mkdir(exist_ok=True)               # startup() wants a model folder that looks complete
+    (tmp_path / "model" / "config.yaml").write_text("x")
 
 
 def test_drain_finishes_the_job_in_hand_claims_nothing_more_and_exits_ok(tmp_path, monkeypatch, puts):

@@ -156,7 +156,7 @@ def render_board(s):
             now.append(f"] {round(s.get('job_pct', 0.0) * 100)}%", style=DIM)
     else:
         now.append("> ", style=GOLD)
-        now.append("Waiting for work..." if state != "stopped" else "Stopped.", style=DIM)
+        now.append("Waiting for work..." if state != "stopped" else (s.get("stop_note") or "Stopped."), style=DIM)
 
     ev = Text()
     rows = s.get("events") or []
@@ -165,7 +165,7 @@ def render_board(s):
     for i, (ts, kind, text, note) in enumerate(rows[:5]):
         import time as _t
         ev.append(_t.strftime("%H:%M", _t.localtime(ts)) + " ", style=DIM)
-        ev.append(f"{kind:<5} ", style={"done": GREEN, "retry": AMBER, "error": AMBER}.get(kind, PARCH))
+        ev.append(f"{kind:<5} ", style={"done": GREEN, "retry": AMBER, "error": AMBER, "dropped": AMBER}.get(kind, PARCH))
         ev.append(text + " ", style=PARCH)
         if note:
             ev.append(f"({note})", style=DIM)
@@ -173,6 +173,9 @@ def render_board(s):
             ev.append("\n")
 
     foot = Text()
+    if s.get("watching"):
+        foot.append(" Worker is running in another window / the service. [S] asks it to stop, [M] menu.", style=AMBER)
+        foot.append("\n")
     if s.get("pause_choice"):
         foot.append(" Pause for: ", style=GOLD)
         foot.append("[1] 15 minutes  [2] 1 hour  [3] 2 hours  [4] 4 hours  [5] until I resume  (any other key cancels)", style=PARCH)
@@ -188,12 +191,14 @@ def render_board(s):
     if s.get("update"):
         foot.append(f" (update {s['update']} available)", style=AMBER)
     if s.get("net"):
-        foot.append(f"   Download: {s['net'][0]:,.0f} MB this job / {s['net'][1]:,.0f} MB session", style=DIM)
+        job_mb, today_mb = s["net"]
+        foot.append(f"   App downloads: {job_mb:,.1f} MB this job / {today_mb:,.0f} MB today",
+                    style=AMBER if job_mb > 200 else DIM)           # one job fetching 200 MB+ means files are re-downloaded
 
     root = Layout(name="root")
     root.split_column(top, mid, Layout(_panel(now, "NOW MAKING"), name="now", size=3),
                       Layout(_panel(ev, "RECENT EVENTS"), name="events", minimum_size=7),
-                      Layout(foot, name="foot", size=2))
+                      Layout(foot, name="foot", size=3 if (s.get("watching") or s.get("pause_choice")) else 2))
     return root
 
 
