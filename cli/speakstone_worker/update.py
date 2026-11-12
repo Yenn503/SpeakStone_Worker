@@ -280,6 +280,7 @@ def swap_linux(exe, new, args, replace=os.replace, execv=os.execv):
 
 
 def apply(release, exe, args, platform=None, fetch=fetch_verified, **ops):
+    # `fetch` may hand back a file that was already proven (the flow downloads before it stops the worker)
     """Download, prove and swap. Does not return when the swap worked (the process is replaced or exits).
     Raises UpdateError otherwise, with the `.new` file already removed."""
     new = fetch(release, exe)
@@ -325,9 +326,10 @@ class UpdateFlow:
     `log` gets one short line per outcome; a failed check never raises."""
 
     def __init__(self, log=lambda s: None, check_fn=check, apply_fn=apply, frozen=None, exe=None, app_exe=None,
-                 args=None, clock=None, env=None):
+                 args=None, clock=None, env=None, fetch_fn=fetch_verified):
         import time
-        self.log, self.check_fn, self.apply_fn = log, check_fn, apply_fn
+        self.log, self.check_fn, self.apply_fn, self.fetch_fn = log, check_fn, apply_fn, fetch_fn
+        self.staged = None              # a downloaded and proven new file, waiting for the swap
         self.frozen = getattr(sys, "frozen", False) if frozen is None else frozen
         self.exe = exe if exe is not None else (sys.executable if self.frozen else None)
         self.app_exe = app_exe
@@ -361,6 +363,26 @@ class UpdateFlow:
     def can_apply(self):
         return can_self_update(self.frozen, self.exe, self.app_exe)
 
+    def prepare(self):
+        """Download and prove the new file now, before anything is stopped. -> None, or a sentence on failure (the
+        release is forgotten and looked for again at the next check)."""
+        if self.staged is not None and Path(self.staged).exists():
+            return None
+        try:
+            self.staged = self.fetch_fn(self.release, self.exe)
+        except UpdateError as e:
+            self.log(f"update not installed: {e}")
+            self.release, self.staged = None, None
+            return f"The update was not installed: {e}."
+        return None
+
+    def give_up(self):
+        """Drop this round (the worker did not finish in time): delete the proven file, look again at the next check."""
+        if self.staged is not None:
+            _remove(self.staged)
+        self.staged, self.release, self.forced = None, None, False
+        self.next_check = self.clock() + CHECK_EVERY
+
     def apply(self):
         """Install the known release. Returns a sentence when nothing was installed; does not return on success."""
         if self.release is None:
@@ -368,10 +390,13 @@ class UpdateFlow:
         ok, why = self.can_apply()
         if not ok:
             return f"Version {self.release.version} is available ({why}). Download it from the releases page."
+        msg = self.prepare()
+        if msg:
+            return msg
         try:
-            self.apply_fn(self.release, self.exe, self.args)
+            self.apply_fn(self.release, self.exe, self.args, fetch=lambda r, e: self.staged)
         except UpdateError as e:
             self.log(f"update not installed: {e}")
-            self.release = None            # tried again at the next check
+            self.release, self.staged = None, None            # tried again at the next check
             return f"The update was not installed: {e}."
         return "Updating..."

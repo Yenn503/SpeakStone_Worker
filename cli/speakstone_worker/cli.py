@@ -264,6 +264,9 @@ def start_now(console, install, settings, flow=None):
             runner = WorkerGroup(install, settings["workers"])
             old = None
     started, paused = time.time(), False
+    ctl = control_mod.Control()
+    if flow:
+        flow.args = ["--start"]                      # an update while working restarts straight into making lines
     col = Collector(install, paths.api_base(), started)
     install_close_handlers(runner.shutdown_fast)
     if not old:
@@ -285,6 +288,8 @@ def start_now(console, install, settings, flow=None):
                     live.update(board.render_board(view), refresh=True)
                     last_draw, last_view, last_size = time.time(), view, console.size
                 k = keys.poll(1.0)
+                if flow and not paused:
+                    update_step(flow, ctl, settings, runner)       # a swap restarts with --start and does not return
                 if k == "p":
                     paused = not paused
                     runner.request_stop() if paused else runner.start()
@@ -294,6 +299,8 @@ def start_now(console, install, settings, flow=None):
     except KeyboardInterrupt:
         result = "exit"
     finally:
+        if flow:
+            flow.args = []                         # back at the menu: an update restarts to the menu
         col.close()
         fresh_screen(console)                      # the board's screen is gone: land on a clean one
         if runner.running:
@@ -484,7 +491,17 @@ def background_tick(runner, st, now=None, readers=None, gate=None, control=None)
     r = readers or {}
     idle_s = (r.get("idle_seconds") or idle.idle_seconds)()
     t = time.localtime(now or time.time())
-    paused = in_pause_window(t.tm_hour * 60 + t.tm_min, st["pause_from"], st["pause_to"]) or bool(control and control.paused)
+    paused = in_pause_window(t.tm_hour * 60 + t.tm_min, st["pause_from"], st["pause_to"])
+    if control is not None and control.paused:
+        # the tray's Pause: finish the job in hand, take no new one (nothing is handed back)
+        if runner.running and control.drain_reason is None:
+            runner.request_drain()
+            control.drain_reason = "pause"
+        runner.poll_stop()
+        return "drain" if runner.running else "keep"
+    if control is not None and control.drain_reason == "pause":      # Resume: cancel a drain that has not finished yet
+        runner.clear_drain()
+        control.drain_reason = None
     mode = "idle"
     if idle_s is None:                         # no idle time available: always on, at low priority
         mode, idle_s, runner.nice = "now", 0, True
@@ -495,6 +512,8 @@ def background_tick(runner, st, now=None, readers=None, gate=None, control=None)
         gate.observe(runner.running, 0 if runner.stop_asked_at or runner.running else _group_exit_code(runner))
         if action == "start" and gate.blocked():
             action = "wait"
+    if action == "start" and control is not None and control.drain_reason == "update":
+        action = "wait"                        # the worker left so the update can go in: do not start another
     if action == "start":
         runner.start()
         if gate is not None:
@@ -519,9 +538,15 @@ def interactive_command():
     return [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "speakstone_worker"]
 
 
-def update_step(flow, control, st, running):
-    """Background loop's update work: look every 6 hours (or when asked), install only when no job is running.
-    Returns True when an install was tried. A successful install does not return (the program restarts)."""
+DRAIN_LIMIT = 30 * 60           # how long an update waits for the job in hand before giving up for this round
+
+
+def update_step(flow, control, st, runner, clock=time.time, drain_limit=DRAIN_LIMIT, allow=True):
+    """Update work for the background loop and the live board. Look every 6 hours (or when asked). When one may be
+    installed: (1) download and prove the new file first, (2) ask a running worker to finish its job and leave, no
+    job is cut short, (3) when it has gone, swap and restart. After `drain_limit` of waiting the round is given up,
+    the worker keeps going and it is tried again at the next check. A successful swap does not return.
+    Returns True when a swap was tried."""
     if update.disabled():
         return False
     if control.take_check():
@@ -530,7 +555,7 @@ def update_step(flow, control, st, running):
     if flow.due():
         flow.check()
         control.update_version = flow.version
-    if not flow.release or running or not (_setting(st, "auto_update", True) or flow.forced):
+    if not flow.release or not allow or not (_setting(st, "auto_update", True) or flow.forced):
         return False
     ok, why = flow.can_apply()
     if not ok:
@@ -538,6 +563,24 @@ def update_step(flow, control, st, running):
             flow.log(f"update {flow.version} not installed here: {why}")
             flow.forced = False
         return False
+    if flow.staged is None or not Path(flow.staged).exists():
+        control.status = control_mod.UPDATING
+        if flow.prepare():                                  # failed: nothing was stopped
+            control.update_version = flow.version
+            return False
+    if runner.running:
+        if control.drain_reason != "update":
+            runner.request_drain()
+            control.drain_reason, control.drain_since = "update", clock()
+            flow.log(f"update {flow.version} is ready; waiting for the job in hand to finish")
+        elif clock() - control.drain_since > drain_limit:
+            runner.clear_drain()
+            control.drain_reason = None
+            flow.log(f"update {flow.version}: the job did not finish in time, trying again later")
+            flow.give_up()
+            control.update_version = None
+        return False
+    control.drain_reason = None
     control.status = control_mod.UPDATING
     note = flow.apply()
     flow.forced = False
@@ -595,6 +638,7 @@ def background(install, st, flow=None, tray_start=tray_mod.start, making=job_run
     setup.sync_worker_files(install, paths.resource_dir())
     log = lambda text: log_background_error(install, text)
     flow = flow or update.UpdateFlow(log=log, app_exe=paths.app_exe())
+    flow.args = ["--background"]               # after an update the new process carries on as the service
     update.cleanup_old(flow.exe)
     control = control_mod.Control()
     runner = WorkerGroup(install, st["workers"])
@@ -609,11 +653,12 @@ def background(install, st, flow=None, tray_start=tray_mod.start, making=job_run
                 reload = getattr(st, "reload", None)
                 if reload:
                     reload()
-                update_step(flow, control, st, runner.running)
-                background_tick(runner, st, gate=gate, control=control)
+                background_tick(runner, st, gate=gate, control=control)    # first: claim at once when the rules allow
+                update_step(flow, control, st, runner)
                 if runner.running and time.time() - last_making > 10:
                     making_now, last_making = making(install, st["workers"]), time.time()
-                control.status = control_mod.status_for(runner.running, making_now and runner.running, control.paused)
+                control.status = control_mod.status_for(runner.running, making_now and runner.running, control.paused,
+                                                        drain=control.drain_reason)
             except Exception as e:                  # one odd tick must not end the service
                 log(f"tick failed: {type(e).__name__}: {e}")
             time.sleep(5)
@@ -642,7 +687,7 @@ def main(argv=None):
         return background(install, st)
     console = make_console()
     set_title(window_title())
-    flow = update.UpdateFlow(log=lambda text: log_background_error(install, text), app_exe=paths.app_exe())
+    flow = update.UpdateFlow(log=lambda text: log_background_error(install, text), app_exe=paths.app_exe(), args=[])
     update.cleanup_old(flow.exe)
     looker = None
     if not update.disabled():                          # a short, silent look in the background; never blocks the menu

@@ -322,37 +322,105 @@ def test_flow_failed_apply_forgets_and_retries_next_check(tmp_path):
 
 
 # ------------------------------------------------------------------ background update step
-def step_setup(tmp_path, st=None, **kw):
-    applied = []
-    f = make_flow(tmp_path, check_result=REL, apply_fn=lambda r, e, a: applied.append((r.version, e, a)), **kw)
-    return f, control_mod.Control(), (st if st is not None else {"auto_update": True}), applied
+class DrainRunner:
+    """A worker that notes drain requests; the test decides when it 'exits'."""
+
+    def __init__(self, running=False, events=None):
+        self.running, self.drain_asks, self.drain_clears, self.events = running, 0, 0, events if events is not None else []
+
+    def request_drain(self):
+        self.drain_asks += 1
+        self.events.append("drain")
+
+    def clear_drain(self):
+        self.drain_clears += 1
+        self.events.append("undrain")
 
 
-def test_update_step_never_swaps_while_a_job_runs(tmp_path, monkeypatch):
+def step_setup(tmp_path, st=None, events=None, **kw):
+    """A flow whose download and swap are recorded in `events`, in the order they happen."""
+    events = events if events is not None else []
+    staged = tmp_path / "app" / "SpeakStoneWorker.new.exe"
+
+    def fetch(rel, exe):
+        staged.write_bytes(b"new")
+        events.append("verify")
+        return staged
+
+    def apply_fn(r, e, a, fetch=None):
+        events.append(("swap", r.version, a))
+    f = make_flow(tmp_path, check_result=REL, apply_fn=apply_fn, **kw)
+    f.fetch_fn = fetch
+    return f, control_mod.Control(), (st if st is not None else {"auto_update": True}), events
+
+
+def test_update_order_is_verify_then_drain_then_wait_then_swap(tmp_path, monkeypatch):
     monkeypatch.delenv("SSW_NO_UPDATE")
-    f, c, st, applied = step_setup(tmp_path)
-    assert cli.update_step(f, c, st, running=True) is False
-    assert c.update_version == "1.3.0" and applied == []
-    assert cli.update_step(f, c, st, running=False) is True and applied[0][0] == "1.3.0"
-    assert applied[0][2] == ["--background"]
+    f, c, st, ev = step_setup(tmp_path)
+    r = DrainRunner(running=True, events=ev)
+    now = [0.0]
+
+    def step():
+        return cli.update_step(f, c, st, r, clock=lambda: now[0])
+    assert step() is False
+    assert ev == ["verify", "drain"] and c.drain_reason == "update" and c.update_version == "1.3.0"
+    assert control_mod.status_for(True, True, False, drain=c.drain_reason) == "Updating after this job"
+    now[0] += 600
+    assert step() is False and ev == ["verify", "drain"]            # still working: waits, asks only once, no kill
+    r.running = False                                               # the job finished and the worker left
+    assert step() is True
+    assert ev == ["verify", "drain", ("swap", "1.3.0", ["--background"])] and c.drain_reason is None
+
+
+def test_a_bad_download_stops_nothing(tmp_path, monkeypatch):
+    monkeypatch.delenv("SSW_NO_UPDATE")
+    f, c, st, ev = step_setup(tmp_path)
+
+    def bad(rel, exe):
+        raise update.UpdateError("the downloaded file does not match its fingerprint")
+    f.fetch_fn = bad
+    r = DrainRunner(running=True, events=ev)
+    assert cli.update_step(f, c, st, r) is False
+    assert ev == [] and r.drain_asks == 0 and f.release is None
+
+
+def test_update_gives_up_after_the_limit_and_leaves_the_worker_running(tmp_path, monkeypatch):
+    monkeypatch.delenv("SSW_NO_UPDATE")
+    f, c, st, ev = step_setup(tmp_path)
+    r = DrainRunner(running=True, events=ev)
+    now = [0.0]
+    cli.update_step(f, c, st, r, clock=lambda: now[0], drain_limit=1800)
+    now[0] = 1801
+    assert cli.update_step(f, c, st, r, clock=lambda: now[0], drain_limit=1800) is False
+    assert ev == ["verify", "drain", "undrain"] and c.drain_reason is None and f.release is None
+    assert not update.staging_name(f.exe).exists() and f.next_check > f.clock()      # tried again at the next check
+    assert r.running and not any(isinstance(e, tuple) for e in ev)
+
+
+def test_update_with_no_worker_running_swaps_straight_away(tmp_path, monkeypatch):
+    monkeypatch.delenv("SSW_NO_UPDATE")
+    f, c, st, ev = step_setup(tmp_path)
+    assert cli.update_step(f, c, st, DrainRunner(running=False, events=ev)) is True
+    assert ev == ["verify", ("swap", "1.3.0", ["--background"])]
 
 
 def test_update_step_auto_off_only_tells_until_asked(tmp_path, monkeypatch):
     monkeypatch.delenv("SSW_NO_UPDATE")
-    f, c, st, applied = step_setup(tmp_path, st={"auto_update": False})
-    assert cli.update_step(f, c, st, running=False) is False and c.update_version == "1.3.0" and applied == []
+    f, c, st, ev = step_setup(tmp_path, st={"auto_update": False})
+    r = DrainRunner(running=False, events=ev)
+    assert cli.update_step(f, c, st, r) is False and c.update_version == "1.3.0" and ev == []
     c.request_check()                                       # "Check for updates now" in the tray
-    assert cli.update_step(f, c, st, running=False) is True and len(applied) == 1
+    assert cli.update_step(f, c, st, r) is True and len(ev) == 2
 
 
 def test_update_step_respects_the_off_switch_and_ineligible_copy(tmp_path, monkeypatch):
-    f, c, st, applied = step_setup(tmp_path)
-    assert cli.update_step(f, c, st, running=False) is False and applied == []        # SSW_NO_UPDATE=1 from conftest
+    f, c, st, ev = step_setup(tmp_path)
+    assert cli.update_step(f, c, st, DrainRunner()) is False and ev == []        # SSW_NO_UPDATE=1 from conftest
     monkeypatch.delenv("SSW_NO_UPDATE")
     logs = []
-    f, c, st, applied = step_setup(tmp_path, in_app=False, log=logs.append)
+    f, c, st, ev = step_setup(tmp_path, in_app=False, log=logs.append)
     c.request_check()
-    assert cli.update_step(f, c, st, running=False) is False and applied == []
+    assert cli.update_step(f, c, st, DrainRunner()) is False and ev == []
     assert any("not installed here" in x for x in logs)
 
 
@@ -361,12 +429,68 @@ def test_checks_only_every_six_hours(tmp_path, monkeypatch):
     n = []
     f, c, st, _ = step_setup(tmp_path, st={"auto_update": False})
     f.check_fn = lambda env=None: n.append(1) or None
-    cli.update_step(f, c, st, running=True)
-    cli.update_step(f, c, st, running=True)
+    r = DrainRunner(running=True)
+    cli.update_step(f, c, st, r)
+    cli.update_step(f, c, st, r)
     assert len(n) == 1
     f.t[0] += 6 * 3600 + 1
-    cli.update_step(f, c, st, running=True)
+    cli.update_step(f, c, st, r)
     assert len(n) == 2
+
+
+def test_no_update_while_the_board_is_paused(tmp_path, monkeypatch):
+    monkeypatch.delenv("SSW_NO_UPDATE")
+    f, c, st, ev = step_setup(tmp_path)
+    assert cli.update_step(f, c, st, DrainRunner(), allow=False) is False and ev == []
+
+
+def test_relaunch_arguments_per_mode():
+    """The new process starts in the mode the old one was in, so it goes straight back to work."""
+    exe = "C:\\A\\SpeakStoneWorker.exe"
+    env = {"SystemRoot": "D:\\Win"}
+    bg = update.relaunch_command(exe, ["--background"], "win32", env)
+    assert bg[-1] == "--background" and "--headless" in bg                      # service: windowless, background
+    assert update.relaunch_command(exe, ["--start"], "win32", env) == [exe, "--start"]   # working board: --start
+    assert update.relaunch_command(exe, [], "win32", env) == [exe]                       # menu: just the menu
+    assert update.relaunch_command("/a/x", ["--start"], "linux") == ["/a/x", "--start"]
+
+
+def test_flow_arguments_follow_the_mode(tmp_path):
+    f = make_flow(tmp_path, check_result=REL)
+    f.args = ["--start"]
+    seen = []
+    f.apply_fn = lambda r, e, a, fetch=None: seen.append(a)
+    f.fetch_fn = lambda r, e: tmp_path / "x"
+    (tmp_path / "x").write_bytes(b"n")
+    f.check()
+    f.apply()
+    assert seen == [["--start"]]
+
+
+def test_background_sets_the_service_arguments(tmp_path, monkeypatch):
+    from speakstone_worker import setup
+    for n, v in (("hide_console", lambda: None), ("set_title", lambda t: None),
+                 ("install_close_handlers", lambda f: None)):
+        monkeypatch.setattr(cli, n, v)
+    monkeypatch.setattr(setup, "is_set_up", lambda i: True)
+    monkeypatch.setattr(setup, "extras_cached", lambda i: True)
+    monkeypatch.setattr(setup, "sync_worker_files", lambda *a: None)
+    monkeypatch.setattr(cli, "WorkerGroup", lambda install, n: FakeRunner())
+
+    def stop(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(cli, "background_tick", stop)
+    f = make_flow(tmp_path, check_result=None)
+    f.args = ["wrong"]
+    cli.background(tmp_path, {"workers": 1}, flow=f, tray_start=lambda *a: None)
+    assert f.args == ["--background"]
+
+
+def test_the_first_tick_after_a_restart_claims_before_any_update_work():
+    """background(): the tick runs before update_step, so a restarted service starts its worker at once."""
+    import inspect
+    src = inspect.getsource(cli.background)
+    assert src.index("background_tick(") < src.index("update_step(")
 
 
 # ------------------------------------------------------------------ service install copies the program
@@ -571,7 +695,13 @@ def test_display_needed_on_linux_only():
 class FakeRunner:
     def __init__(self, running=False):
         self.running, self.exit_code, self.stop_asked_at, self.nice = running, None, 0.0, False
-        self.starts, self.stops = 0, 0
+        self.starts, self.stops, self.drains, self.undrains = 0, 0, 0, 0
+
+    def request_drain(self):
+        self.drains += 1
+
+    def clear_drain(self):
+        self.undrains += 1
 
     def start(self):
         self.starts += 1
@@ -595,21 +725,43 @@ RD = {"idle_seconds": lambda: 9999, "fullscreen": lambda: False, "battery": lamb
 ST = {"idle_minutes": 1, "pause_from": "", "pause_to": "", "block_fullscreen": False, "block_on_battery": False}
 
 
-def test_pause_stops_the_worker_and_blocks_new_starts_until_resume():
+def test_pause_uses_the_drain_not_a_hard_stop():
     c, r = control_mod.Control(), FakeRunner(running=True)
     c.set_paused(True)
-    assert cli.background_tick(r, ST, readers=RD, control=c) == "stop" and r.stops == 1
-    r.running = False
+    assert cli.background_tick(r, ST, readers=RD, control=c) == "drain"
+    assert r.drains == 1 and r.stops == 0 and c.drain_reason == "pause"      # job in hand is kept, not handed back
+    assert cli.background_tick(r, ST, readers=RD, control=c) == "drain" and r.drains == 1      # asked once
+    assert control_mod.status_for(r.running, True, c.paused, drain=c.drain_reason) == "Pausing after this job"
+    r.running = False                                                          # the job finished, the worker left
     assert cli.background_tick(r, ST, readers=RD, control=c) == "keep" and r.starts == 0
+    assert control_mod.status_for(r.running, False, c.paused, drain=c.drain_reason) == "Paused"
     c.set_paused(False)
     assert cli.background_tick(r, ST, readers=RD, control=c) == "start" and r.starts == 1
+    assert r.undrains == 1
+
+
+def test_resume_before_the_job_ends_cancels_the_drain():
+    c, r = control_mod.Control(), FakeRunner(running=True)
+    c.set_paused(True)
+    cli.background_tick(r, ST, readers=RD, control=c)
+    c.set_paused(False)
+    cli.background_tick(r, ST, readers=RD, control=c)
+    assert r.undrains == 1 and c.drain_reason is None and r.starts == 0
+
+
+def test_no_new_worker_while_an_update_is_draining():
+    c, r = control_mod.Control(), FakeRunner(running=False)
+    c.drain_reason = "update"
+    assert cli.background_tick(r, ST, readers=RD, control=c) == "wait" and r.starts == 0
 
 
 def test_status_lines():
     f = control_mod.status_for
     assert f(True, True, False) == "Working" and f(True, False, False) == "Waiting for work"
-    assert f(True, True, True) == "Paused" and f(False, False, False) == "Waiting for the PC to be idle"
+    assert f(True, True, True) == "Pausing after this job" and f(False, False, True) == "Paused"
+    assert f(False, False, False) == "Waiting for the PC to be idle"
     assert f(False, False, False, updating=True) == "Updating"
+    assert f(True, True, False, drain="update") == "Updating after this job"
 
 
 def test_tray_actions_change_control_and_settings(tmp_path):

@@ -149,6 +149,9 @@ def kill_pid_tree(pid):
         pass
 
 
+DRAIN_FILE = "STOP_AFTER_JOB"      # the worker finishes the job in hand, claims nothing new, then exits (net_worker.py)
+
+
 class WorkerRunner:
     def __init__(self, install, popen=subprocess.Popen, clock=time.time, nice=False, index=1):
         self.install = Path(install)
@@ -239,6 +242,7 @@ class WorkerRunner:
         if self.running:
             return False
         self.clear_stop()
+        self.clear_drain()
         kw = {}
         if sys.platform == "win32":
             kw["creationflags"] = 0x08000000        # CREATE_NO_WINDOW
@@ -265,6 +269,22 @@ class WorkerRunner:
             except OSError:
                 pass
         return True
+
+    def request_drain(self):
+        """Ask the worker to finish its job and leave. Nothing is handed back and nothing is killed."""
+        if not self.running:
+            return
+        try:
+            self.work_dir.mkdir(parents=True, exist_ok=True)
+            (self.work_dir / DRAIN_FILE).write_text("drain", encoding="utf-8")
+        except OSError:
+            pass
+
+    def clear_drain(self):
+        try:
+            (self.work_dir / DRAIN_FILE).unlink()
+        except OSError:
+            pass
 
     def clear_stop(self):
         try:
@@ -349,6 +369,14 @@ class WorkerGroup:
     def request_stop(self):
         for r in self.runners:
             r.request_stop()
+
+    def request_drain(self):
+        for r in self.runners:
+            r.request_drain()
+
+    def clear_drain(self):
+        for r in self.runners:
+            r.clear_drain()
 
     def poll_stop(self, grace=120):
         return all([r.poll_stop(grace) for r in self.runners])

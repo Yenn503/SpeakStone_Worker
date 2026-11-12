@@ -4,6 +4,7 @@ import threading
 
 WORKING, WAITING_WORK, PAUSED, WAITING_IDLE, UPDATING, STOPPED = (
     "Working", "Waiting for work", "Paused", "Waiting for the PC to be idle", "Updating", "Stopped")
+PAUSING, UPDATING_AFTER = "Pausing after this job", "Updating after this job"
 
 
 class Control:
@@ -14,6 +15,8 @@ class Control:
         self.check_now = False           # "Check for updates now": look straight away and install even if auto is off
         self.status = WAITING_IDLE
         self.update_version = None       # a newer version that is known but not installed yet
+        self.drain_reason = None         # None, "pause" or "update": why the worker was asked to finish its job and leave
+        self.drain_since = 0.0
 
     def set_paused(self, value):
         with self.lock:
@@ -38,12 +41,14 @@ class Control:
             return v
 
 
-def status_for(running, making, paused, updating=False):
-    """The one-line status the tray shows. Pure."""
+def status_for(running, making, paused, updating=False, drain=None):
+    """The one-line status the tray shows. Pure. `drain` is control.drain_reason."""
     if updating:
         return UPDATING
+    if drain == "update" and running:
+        return UPDATING_AFTER
     if paused:
-        return PAUSED
+        return PAUSING if running else PAUSED
     if running:
         return WORKING if making else WAITING_WORK
     return WAITING_IDLE
