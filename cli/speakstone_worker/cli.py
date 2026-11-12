@@ -1,7 +1,6 @@
 """Menu, live board, settings and the hidden --background mode."""
 import argparse
 import ctypes
-import json
 import os
 import platform
 import re
@@ -330,11 +329,17 @@ def start_now(console, install, settings, flow=None):
     if not old and not watching:
         runner.start()
     result = "menu"
+    monitor = stats.GpuMonitor()
+    # Set when the worker should run again but the last one is still on its way out (it hands its job back first, which
+    # takes a few seconds). start() refuses while it runs, so the start waits here until it has gone.
+    want_start = False
     try:
         with KeyReader() as keys, Live(console=console, screen=VT["on"], auto_refresh=False) as live:
             last_gpu, gpu, last_draw, last_view, last_size = 0, None, 0, None, console.size
-            monitor = stats.GpuMonitor()
             while True:
+                if want_start and not paused and not runner.running:
+                    runner.start()
+                    want_start = False
                 if time.time() - last_gpu > 2:
                     gpu, last_gpu = monitor.read(), time.time()
                 state = "paused" if paused else ("stopped" if not runner.running and not watching else "idle")
@@ -352,10 +357,13 @@ def start_now(console, install, settings, flow=None):
                     last_draw, last_view, last_size = time.time(), view, console.size
                 k = keys.poll(1.0)
                 if flow and not paused and not watching:
-                    update_step(flow, ctl, settings, runner)       # a swap restarts with --start and does not return
+                    # a swap restarts with --start and does not return; True here means it failed after the worker
+                    # had already left for it, so the worker starts again
+                    if update_step(flow, ctl, settings, runner):
+                        want_start = True
                 if paused and paused_until and time.time() >= paused_until:      # a timed pause ends by itself
                     paused, paused_until = False, None
-                    runner.start()
+                    want_start = True
                 if watching:
                     if k == "s":                                              # stop the OTHER worker through its STOP file
                         runner.stop_foreign()
@@ -375,7 +383,7 @@ def start_now(console, install, settings, flow=None):
                 elif k == "p":
                     if paused:
                         paused, paused_until = False, None
-                        runner.start()
+                        want_start = True
                     else:
                         choosing = True                                       # next key picks how long
                 elif k in ("s", "m"):
@@ -387,6 +395,7 @@ def start_now(console, install, settings, flow=None):
         if flow:
             flow.args = []                         # back at the menu: an update restarts to the menu
         col.close()
+        monitor.close()
         fresh_screen(console)                      # the board's screen is gone: land on a clean one
         if runner.running:
             console.print("Giving the current job back before stopping...")
