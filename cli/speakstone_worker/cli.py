@@ -14,7 +14,8 @@ from pathlib import Path
 from rich.console import Console
 from rich.live import Live
 
-from . import APP_NAME, __version__, board, enroll as enroll_mod, idle, paths, service, setup, stats, uninstall
+from . import (APP_NAME, __version__, board, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
+               stats, tray as tray_mod, uninstall, update)
 from .keys import KeyReader, drain
 from .runner import WorkerGroup, install_close_handlers
 from .settings import Settings, in_pause_window, parse_hhmm
@@ -60,6 +61,23 @@ def fresh_screen(console):
     except Exception:
         pass
     console.clear()
+
+
+def window_title(status=""):
+    return f"{APP_NAME} {__version__}" + (f" - {status}" if status else "")
+
+
+def set_title(text, platform=None, kernel32=None, write=None):
+    """Console window title. Windows: the API (works with or without ANSI); elsewhere the terminal escape."""
+    platform = platform or sys.platform
+    try:
+        if platform == "win32":
+            import ctypes
+            (kernel32 or ctypes.windll.kernel32).SetConsoleTitleW(text)
+        else:
+            (write or sys.stdout.write)(f"\x1b]0;{text}\x07")
+    except Exception:
+        pass
 
 
 def make_console():
@@ -208,7 +226,7 @@ class Collector:
         self._stop = True
 
 
-def board_state(install, queue, gpu, state, started, now=None, events=None, workers=1, net=None):
+def board_state(install, queue, gpu, state, started, now=None, events=None, workers=1, net=None, update_version=None):
     now = now or time.time()
     if events is not None:
         s = stats.summarize(events, now)
@@ -217,7 +235,7 @@ def board_state(install, queue, gpu, state, started, now=None, events=None, work
         s = stats.merge_summaries([stats.summarize(stats.read_events(d), now) for d in dirs])
     s["workers"] = workers
     s["net"] = net.figures(s.get("job")) if net else None
-    s["queue"], s["gpu"], s["state"] = queue, gpu, state
+    s["queue"], s["gpu"], s["state"], s["update"] = queue, gpu, state, update_version
     s["time_left"] = stats.time_left(queue, s["words_hour"], s["lines_hour"])
     s["since_label"] = time.strftime("%H:%M", time.localtime(s["first_today"] or started))
     if s["making"]:
@@ -227,7 +245,7 @@ def board_state(install, queue, gpu, state, started, now=None, events=None, work
     return s
 
 
-def start_now(console, install, settings):
+def start_now(console, install, settings, flow=None):
     if not ensure_setup(console, install):
         return "menu"
     fresh_screen(console)
@@ -259,7 +277,8 @@ def start_now(console, install, settings):
                 if time.time() - last_gpu > 2:
                     gpu, last_gpu = monitor.read(), time.time()
                 state = "paused" if paused else ("stopped" if not runner.running else "idle")
-                view = board_state(install, col.queue, gpu, state, started, workers=runner.count, net=net)
+                view = board_state(install, col.queue, gpu, state, started, workers=runner.count, net=net,
+                                   update_version=flow.version if flow else None)
                 # Redraw only every 5 s or when something changed: a 4/s full-screen redraw flickered (owner 2026-11-11).
                 resized = console.size != last_size
                 if resized or (view != last_view and time.time() - last_draw >= 2) or time.time() - last_draw >= 5:
@@ -295,10 +314,13 @@ def settings_menu(console, install, st):
         console.print(f"  [{board.GOLD}][4][/] Show my worker label: [bold]{worker_label(install) or '(not set up yet)'}[/]")
         console.print(f"  [{board.GOLD}][5][/] Workers on this card: [bold]{st['workers']}[/]")
         console.print(f"  [{board.GOLD}][6][/] Remove SpeakStone Worker from this PC (deletes every downloaded file)")
+        console.print(f"  [{board.GOLD}][7][/] Update automatically: [bold]{'on' if st['auto_update'] else 'off'}[/]")
         console.print(f"  [{board.GOLD}][B][/] Back")
         with KeyReader() as keys:
             k = keys.wait()
-        if k == "6":
+        if k == "7":
+            st["auto_update"] = not st["auto_update"]
+        elif k == "6":
             if remove_program(console, install):
                 return "exit"
         elif k == "1":
@@ -457,12 +479,12 @@ def log_background_error(install, text):
         pass
 
 
-def background_tick(runner, st, now=None, readers=None, gate=None):
+def background_tick(runner, st, now=None, readers=None, gate=None, control=None):
     """One decision. Returns the action taken. Pure apart from starting/stopping the worker."""
     r = readers or {}
     idle_s = (r.get("idle_seconds") or idle.idle_seconds)()
     t = time.localtime(now or time.time())
-    paused = in_pause_window(t.tm_hour * 60 + t.tm_min, st["pause_from"], st["pause_to"])
+    paused = in_pause_window(t.tm_hour * 60 + t.tm_min, st["pause_from"], st["pause_to"]) or bool(control and control.paused)
     mode = "idle"
     if idle_s is None:                         # no idle time available: always on, at low priority
         mode, idle_s, runner.nice = "now", 0, True
@@ -485,8 +507,83 @@ def background_tick(runner, st, now=None, readers=None, gate=None):
     return action
 
 
-def background(install, st):
+def _setting(st, key, default=None):
+    try:
+        return st[key]
+    except KeyError:
+        return default
+
+
+def interactive_command():
+    """[program, args] that opens the normal menu: the exe itself, or `python -m speakstone_worker` from source."""
+    return [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "speakstone_worker"]
+
+
+def update_step(flow, control, st, running):
+    """Background loop's update work: look every 6 hours (or when asked), install only when no job is running.
+    Returns True when an install was tried. A successful install does not return (the program restarts)."""
+    if update.disabled():
+        return False
+    if control.take_check():
+        flow.forced = True
+        flow.next_check = 0.0
+    if flow.due():
+        flow.check()
+        control.update_version = flow.version
+    if not flow.release or running or not (_setting(st, "auto_update", True) or flow.forced):
+        return False
+    ok, why = flow.can_apply()
+    if not ok:
+        if flow.forced:
+            flow.log(f"update {flow.version} not installed here: {why}")
+            flow.forced = False
+        return False
+    control.status = control_mod.UPDATING
+    note = flow.apply()
+    flow.forced = False
+    flow.log(note)
+    control.update_version = flow.version
+    return True
+
+
+def make_tray_actions(install, control, st, flow, open_board=tray_mod.open_board, open_folder=tray_mod.open_folder):
+    def toggle(key):
+        def run():
+            reload = getattr(st, "reload", None)
+            if reload:
+                reload()
+            st[key] = not st[key]
+        return run
+
+    def logs():
+        d = Path(install) / "work" / "logs"
+        d.mkdir(parents=True, exist_ok=True)
+        open_folder(d)
+    return {"pause": lambda: control.set_paused(True), "resume": lambda: control.set_paused(False),
+            "block_fullscreen": toggle("block_fullscreen"), "block_on_battery": toggle("block_on_battery"),
+            "auto_update": toggle("auto_update"), "board": lambda: open_board(interactive_command()),
+            "check": control.request_check, "update_now": control.request_check, "logs": logs,
+            "quit": control.request_quit}
+
+
+def tray_state_reader(control, st):
+    return lambda: {"status": control.status, "paused": control.paused,
+                    "settings": {k: _setting(st, k) for k, _ in tray_mod.TOGGLES},
+                    "update_version": control.update_version}
+
+
+def job_running_now(install, workers=1, now=None):
+    """True when the log shows a claimed job that has not finished (drives the tray's 'Working' line)."""
+    try:
+        dirs = [Path(install) / "work" / "logs"] + ([Path(install) / "work_2" / "logs"] if workers == 2 else [])
+        return any(stats.summarize(stats.read_events(d), now or time.time())["making"] for d in dirs)
+    except Exception:
+        return False
+
+
+def background(install, st, flow=None, tray_start=tray_mod.start, making=job_running_now):
     hide_console()
+    set_title(window_title("background"))
     if setup.is_set_up(install) and not setup.extras_cached(install):
         setup.forget_extras(install)
         try:
@@ -496,19 +593,35 @@ def background(install, st):
     if not setup.is_set_up(install):
         return 2
     setup.sync_worker_files(install, paths.resource_dir())
+    log = lambda text: log_background_error(install, text)
+    flow = flow or update.UpdateFlow(log=log, app_exe=paths.app_exe())
+    update.cleanup_old(flow.exe)
+    control = control_mod.Control()
     runner = WorkerGroup(install, st["workers"])
     install_close_handlers(runner.shutdown_fast)
     gate = RestartGate()
+    tray = tray_start(__version__, tray_state_reader(control, st), make_tray_actions(install, control, st, flow),
+                      paths.assets_dir() / "icon.png", log)
+    last_making, making_now = 0.0, False
     try:
-        while True:
+        while not control.quit:
             try:
-                background_tick(runner, st, gate=gate)
+                reload = getattr(st, "reload", None)
+                if reload:
+                    reload()
+                update_step(flow, control, st, runner.running)
+                background_tick(runner, st, gate=gate, control=control)
+                if runner.running and time.time() - last_making > 10:
+                    making_now, last_making = making(install, st["workers"]), time.time()
+                control.status = control_mod.status_for(runner.running, making_now and runner.running, control.paused)
             except Exception as e:                  # one odd tick must not end the service
-                log_background_error(install, f"tick failed: {type(e).__name__}: {e}")
+                log(f"tick failed: {type(e).__name__}: {e}")
             time.sleep(5)
     except KeyboardInterrupt:
         pass
     finally:
+        if tray:
+            tray.stop()
         if runner.running:
             runner.stop_and_wait()
     return 0
@@ -528,16 +641,35 @@ def main(argv=None):
     if a.background:
         return background(install, st)
     console = make_console()
+    set_title(window_title())
+    flow = update.UpdateFlow(log=lambda text: log_background_error(install, text), app_exe=paths.app_exe())
+    update.cleanup_old(flow.exe)
+    looker = None
+    if not update.disabled():                          # a short, silent look in the background; never blocks the menu
+        looker = threading.Thread(target=flow.check, daemon=True)
+        looker.start()
+    auto_tried = False
     try:
         choice = "1" if a.start else None
         while True:
             if choice is None:
+                if looker:
+                    looker.join(1.5)                   # the first menu waits a moment for the answer, no longer
+                    looker = None
+                if flow.release and not auto_tried and st["auto_update"] and flow.can_apply()[0]:
+                    auto_tried = True
+                    console.print(f"Updating to {flow.version}...")
+                    console.print(flow.apply())        # does not return when it worked
+                    time.sleep(2)
                 fresh_screen(console)
-                console.print(board.menu_panel(service.is_installed()))
+                console.print(board.menu_panel(service.is_installed(), flow.version))
                 with KeyReader() as keys:
                     choice = keys.wait()
-            if choice == "1":
-                if start_now(console, install, st) == "exit":
+            if choice == "u" and flow.release:
+                console.print(flow.apply())
+                time.sleep(2.5)
+            elif choice == "1":
+                if start_now(console, install, st, flow) == "exit":
                     return 0
             elif choice == "2":
                 if service.is_installed():
@@ -545,7 +677,9 @@ def main(argv=None):
                 elif ensure_setup(console, install):
                     ok = service.install(install)
                     console.print("Installed. It starts when your PC has been idle for "
-                                  f"{st['idle_minutes']} minutes." if ok else "Could not install the service.")
+                                  f"{st['idle_minutes']} minutes." if ok else
+                                  "Could not install the service (the program could not be copied into its own folder, "
+                                  "or the task was refused).")
                 time.sleep(2)
             elif choice == "3":
                 if settings_menu(console, install, st) == "exit":

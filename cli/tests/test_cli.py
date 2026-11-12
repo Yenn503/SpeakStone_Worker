@@ -521,8 +521,11 @@ def test_install_windows_calls_schtasks_only(tmp_path):
     class R:
         returncode = 0
 
+    exe = tmp_path / "share" / "SpeakStoneWorker.exe"
+    exe.parent.mkdir()
+    exe.write_bytes(b"x")
     ok = service.install(tmp_path, runner=lambda c, **k: calls.append(c) or R(), platform="win32", frozen=True,
-                         executable="C:/x/SpeakStoneWorker.exe")
+                         executable=str(exe), app_target=tmp_path / "app" / "SpeakStoneWorker.exe")
     assert ok and calls[0][:3] == ["schtasks", "/Create", "/TN"] and calls[0][3] == service.TASK_NAME and "/XML" in calls[0]
     assert (tmp_path / "task.xml").exists()
     calls.clear()
@@ -1277,7 +1280,7 @@ def test_background_survives_a_failing_tick_and_logs_it(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "install_close_handlers", lambda f: None)
     calls = []
 
-    def tick(runner, st, gate=None):
+    def tick(runner, st, gate=None, control=None):
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("odd")
@@ -1286,7 +1289,7 @@ def test_background_survives_a_failing_tick_and_logs_it(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "background_tick", tick)
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
     monkeypatch.setattr(cli, "WorkerGroup", lambda install, n: FakeRunner())
-    assert cli.background(tmp_path, {"workers": 1}) == 0
+    assert cli.background(tmp_path, {"workers": 1}, tray_start=lambda *a: None) == 0
     assert len(calls) == 2
     assert "RuntimeError: odd" in (tmp_path / "work" / "logs" / "background.log").read_text()
 

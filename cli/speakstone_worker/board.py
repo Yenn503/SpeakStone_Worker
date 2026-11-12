@@ -6,7 +6,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from . import DISCLAIMER, TAGLINE
+from . import APP_NAME, DISCLAIMER, TAGLINE, __version__
 from .stats import format_duration
 
 GOLD, PARCH, DIM, GREEN, AMBER, BIG, BG = "#e9bb4d", "#d4bb8c", "#7d6b52", "#8fb04a", "#e0962c", "bold #f6e3b0", "#14100c"
@@ -36,14 +36,18 @@ def banner():
     return t
 
 
-def menu_screen(service_installed=False):
+def menu_screen(service_installed=False, update_version=None):
     t = Text()
     t.append_text(banner())
     t.append("\n  " + TAGLINE + "\n", style=PARCH)
-    t.append("  " + DISCLAIMER + "\n\n", style=DIM)
+    t.append("  " + DISCLAIMER + "\n", style=DIM)
+    t.append(f"  {APP_NAME} {__version__}\n\n", style=DIM)
     items = [("1", "Start now", ""), ("2", "Uninstall the service" if service_installed else "Install as a service",
                                       "" if service_installed else "(runs when your PC is idle)"),
-             ("3", "Settings", ""), ("Q", "Quit", "")]
+             ("3", "Settings", "")]
+    if update_version:
+        items.append(("U", "Update now", f"(version {update_version} is available)"))
+    items.append(("Q", "Quit", ""))
     for k, label, note in items:
         t.append(f"  [{k}] ", style=GOLD)
         t.append(label, style=BIG)
@@ -54,9 +58,9 @@ def menu_screen(service_installed=False):
     return t
 
 
-def menu_panel(service_installed=False):
+def menu_panel(service_installed=False, update_version=None):
     """The whole menu as ONE panel, printed once; then a single key is read."""
-    return Panel(menu_screen(service_installed), title=f"[{GOLD}]MENU[/]", title_align="left", border_style=GOLD,
+    return Panel(menu_screen(service_installed, update_version), title=f"[{GOLD}]MENU[/]", title_align="left", border_style=GOLD,
                  box=box.SQUARE, style=f"on {BG}", padding=(0, 1))
 
 
@@ -175,6 +179,9 @@ def render_board(s):
     foot.append("stop and exit", style=DIM)
     foot.append("   [M] ", style=GOLD)
     foot.append("menu", style=DIM)
+    foot.append(f"   v{__version__}", style=DIM)
+    if s.get("update"):
+        foot.append(f" (update {s['update']} available)", style=AMBER)
     if s.get("net"):
         foot.append(f"   Download: {s['net'][0]:,.0f} MB this job / {s['net'][1]:,.0f} MB session", style=DIM)
 
