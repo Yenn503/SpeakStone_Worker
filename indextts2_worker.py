@@ -434,8 +434,10 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
                 seed = rw.compute_generation_seed(row) + qc_held.get(sf_name, 0)   # a held take retries on the next seed
                 vec = emotion_vector(row)
                 beams = int(row["num_beams"]) if row.get("num_beams") else beams_for(vec)
-                wav_path = tmp / f"t_{os.getpid()}_{time.time_ns()}.wav"
-                ogg_path = tmp / f"t_{os.getpid()}_{time.time_ns()}.ogg"
+                # Named by the line's place in the batch, not the clock. Two lines made close together could get the
+                # same time_ns() on Windows, and the two finish threads then wrote and moved each other's files.
+                wav_path = tmp / f"t_{os.getpid()}_{i}.wav"
+                ogg_path = tmp / f"t_{os.getpid()}_{i}.ogg"
                 t0 = time.time()
                 try:
                     random.seed(seed)
