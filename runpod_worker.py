@@ -173,14 +173,17 @@ TARGET_RMS_DB = -18.0
 # -26 dB RMS. Now every clip is measured (EBU R128 integrated loudness, after trim and post_af) and:
 #   under TARGET - WINDOW            -> levelled to TARGET (two-pass loudnorm, linear gain, limiter);
 #   over TARGET + WINDOW             -> levelled down to TARGET, "!" lines included;
-#   within the window                -> untouched (so a shouted line may sit up to -14).
+#   within the window                -> gain untouched (so a shouted line may sit up to -14), peaks limited.
+# Until 2026-11-12 (recipe v2) a clip inside the window skipped the limiter along with the gain. Measured that day on
+# 60 such clips: median true peak +0.9 dBTP, 50 of 60 above 0 dBTP (they can clip), against -2.4 dBTP for levelled
+# clips. Recipe v3 runs the same limiter on every clip.
 # Until 2026-11-11 a "!" line over the window was left loud. Lines kept that way came out far too hot (around -8 LUFS,
 # true peaks above 0 dBTP, so they clipped) and sounded distorted; on a listening test -14 to -16 was preferred.
 TARGET_LUFS = -16.0
 LOUDNESS_WINDOW_LU = 2.0
 PEAK_CEILING_DB = -3.0  # loudnorm true-peak target; Vorbis at 32 kbps overshoots it by 1-2 dB
 LIMIT_LINEAR = 0.7      # alimiter ceiling (-3.1 dBFS) after loudnorm
-LEVEL_RECIPE = "lufs-16-w2-v2"
+LEVEL_RECIPE = "lufs-16-w2-v3"
 
 
 def loudness_plan(measured_i, shout):
@@ -270,6 +273,8 @@ def apply_post_fx_and_encode(in_wav, out_ogg, post_af=None, bitrate="32k", shout
             if plan:
                 filters.append(f"volume={TARGET_LUFS - mi:.2f}dB,alimiter=limit={LIMIT_LINEAR}:level=false")
                 info["level"] = plan
+        if not filters:                     # inside the window, or not measurable: no gain, but the same peak limit
+            filters.append(f"alimiter=limit={LIMIT_LINEAR}:level=false")
         args = ["-i", mid] + (["-af", ",".join(filters)] if filters else [])
         r = _ffmpeg(args + ["-c:a", "libvorbis", "-b:a", str(bitrate), "-ar", str(OUTPUT_SAMPLE_RATE),
                             "-ac", str(OUTPUT_CHANNELS), str(out_ogg)])

@@ -224,7 +224,7 @@ def test_loudness_plan_levels_shouted_lines_too():
             if node.name == "_loudnorm_measure":
                 assert "_run_with_retry(" in ast.get_source_segment(src, node)
     plan = ns["loudness_plan"]
-    assert ns["LEVEL_RECIPE"] == "lufs-16-w2-v2"
+    assert ns["LEVEL_RECIPE"] == "lufs-16-w2-v3"
     assert plan(-8.0, True) == "down" and plan(-8.0, False) == "down"
     assert plan(-25.0, True) == "up" and plan(-15.0, True) is None and plan(-80.0, False) is None and plan(None, 1) is None
 
