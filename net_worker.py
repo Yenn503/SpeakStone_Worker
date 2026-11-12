@@ -86,6 +86,7 @@ LIVE_KEYS = ("gpu_util", "gpu_mem_used_mib", "vram_free_mib", "session_started_a
              "session_audio_sec", "session_words", "words_per_hour", "audio_sec_per_hour")
 
 EXIT_OK, EXIT_CONFIG, EXIT_KEY, EXIT_PROTOCOL, EXIT_MODEL = 0, 2, 3, 4, 5
+DRAIN_FILE = "STOP_AFTER_JOB"           # finish the job in hand, claim no more, exit (see Worker.drain_requested)
 
 
 # ----------------------------------------------------------------------------------------------- exceptions
@@ -1232,6 +1233,20 @@ class Worker:
             pass
         return False
 
+    def drain_requested(self):
+        """STOP_AFTER_JOB in the work folder: finish the job in hand (make, upload, complete), claim nothing new, then
+        exit cleanly. Unlike STOP it never gives a job back."""
+        try:
+            return (self.work / DRAIN_FILE).exists()
+        except OSError:
+            return False
+
+    def clear_drain(self):
+        try:
+            (self.work / DRAIN_FILE).unlink()
+        except OSError:
+            pass
+
     def _stop_now(self, ctx=None):
         """A stop is wanted and may act now: not while a finished job is still uploading (ctx in its grace time)."""
         return self.stop_requested() and not (ctx is not None and ctx.in_grace())
@@ -1240,6 +1255,8 @@ class Worker:
         end = time.time() + seconds
         while time.time() < end:
             if self._stop_now(ctx) or (ctx is not None and (ctx.lost.is_set() or ctx.fatal is not None)):
+                return
+            if ctx is None and self.drain_requested():      # idle or backing off: nothing in hand, so leave now
                 return
             time.sleep(min(0.5, max(0.0, end - time.time())))
 
@@ -1354,6 +1371,7 @@ class Worker:
         if not mdir.is_dir() or not (mdir / "config.yaml").exists():
             raise ExitRun(EXIT_MODEL, f"model dir missing or incomplete: {mdir}")
         self.work.mkdir(parents=True, exist_ok=True)
+        self.clear_drain()                      # a drain file left from an earlier run must not stop this one
         for d in (self.jobs_dir, self.refs_dir):
             d.mkdir(parents=True, exist_ok=True)
         self.log.event("start", None, version=WORKER_VERSION, protocol=PROTOCOL, machine=self.cfg.machine_name,
@@ -1419,6 +1437,10 @@ class Worker:
             while True:
                 if self.stop_requested():
                     raise Stop()
+                if self.drain_requested():
+                    self.clear_drain()
+                    self.log.event("stop", None, reason="drained")
+                    return EXIT_OK
                 if self.max_cycles is not None and cycles >= self.max_cycles:
                     self.log.event("stop", None, reason="max_cycles")
                     return EXIT_OK
@@ -1441,6 +1463,8 @@ class Worker:
 
     def cycle(self):
         self.wait_for_vram()
+        if self.drain_requested():              # asked while waiting: claim nothing, the loop exits
+            return
         resume = self.scan_resume()
         try:
             status, data = self.call_retry(lambda: self._claim(resume))

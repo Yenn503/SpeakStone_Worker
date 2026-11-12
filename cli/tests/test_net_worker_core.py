@@ -578,3 +578,65 @@ def test_run_batch_does_not_depend_on_cwd(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path / "job")
     assert m.run_batch(None, "chunk.json", "out", "refs") == 0
     assert (tmp_path / "job" / "out").is_dir()
+
+
+# ------------------------------------------------------------------ 9. drain: finish the job in hand, claim nothing new
+def _ready(tmp_path):
+    (tmp_path / "config.yaml").write_text("x")             # startup() wants a model folder that looks complete
+
+
+def test_drain_finishes_the_job_in_hand_claims_nothing_more_and_exits_ok(tmp_path, monkeypatch, puts):
+    _ready(tmp_path)
+    api = FakeApi([job(JOB1), job(JOB2)])
+    w, state = make_worker(tmp_path, monkeypatch, api)
+    real = w.upload_all
+
+    def upload_then_drain(ctx, st):
+        (w.work / nw.DRAIN_FILE).write_text("")             # the app asks while the job is still going up
+        return real(ctx, st)
+    w.upload_all = upload_then_drain
+    assert w.run() == nw.EXIT_OK
+    assert api.routes().count("claim") == 1 and "complete" in api.routes() and "fail" not in api.routes()
+    assert len(api.jobs) == 1                               # the second job was never claimed
+    assert not (w.work / nw.DRAIN_FILE).exists()            # removed because the worker left on account of it
+    assert events(tmp_path, "stop") and "drained" in events(tmp_path, "stop")[-1]
+    assert not w.engine_alive()                             # the kept engine was shut down properly
+    assert not w.stop_requested()                           # and it was not the STOP path
+
+
+def test_drain_with_nothing_in_hand_exits_at_once_without_claiming(tmp_path, monkeypatch):
+    _ready(tmp_path)
+    api = FakeApi([job(JOB1)])
+    w, _ = make_worker(tmp_path, monkeypatch, api)
+    (w.work).mkdir(parents=True, exist_ok=True)
+    orig = w.startup
+
+    def startup_then_ask():
+        orig()                                              # startup clears stale files, then the app asks
+        (w.work / nw.DRAIN_FILE).write_text("")
+    w.startup = startup_then_ask
+    assert w.run() == nw.EXIT_OK and api.routes() == [] and not (w.work / nw.DRAIN_FILE).exists()
+
+
+def test_drain_asked_during_an_idle_wait_ends_the_wait(tmp_path, monkeypatch):
+    _ready(tmp_path)
+    w, _ = make_worker(tmp_path, monkeypatch, FakeApi())
+    t0 = time.time()
+    threading.Timer(0.3, lambda: (w.work / nw.DRAIN_FILE).write_text("")).start()
+    w.sleep_impl = w._real_sleep
+    assert w.run() == nw.EXIT_OK and time.time() - t0 < 20     # the idle wait is 30 s or more
+
+
+def test_stale_drain_file_is_cleared_at_start(tmp_path, monkeypatch):
+    _ready(tmp_path)
+    w, _ = make_worker(tmp_path, monkeypatch, FakeApi())
+    w.work.mkdir(parents=True, exist_ok=True)
+    (w.work / nw.DRAIN_FILE).write_text("")
+    w.startup()
+    assert not (w.work / nw.DRAIN_FILE).exists()
+
+
+def test_stop_file_still_means_stop_now(tmp_path, monkeypatch):
+    w, _ = make_worker(tmp_path, monkeypatch)
+    (w.work / "STOP").write_text("")
+    assert w.stop_requested() and not w.drain_requested()
