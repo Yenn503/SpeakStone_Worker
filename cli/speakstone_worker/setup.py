@@ -76,6 +76,7 @@ LABELS = {
 LANE_A = ("torch", "packages")
 LANE_B = ("model", "extras", "ffmpeg")
 HF_HUB_SPEC = "huggingface_hub>=0.32,<1.0"      # 0.32 is the first with the fast transfer package built in
+RUN_TRIES = 3                    # each setup command is tried this many times before setup stops
 HF_FAST_ENV = {"HF_XET_HIGH_PERFORMANCE": "1"}   # setup-time only: use every core and the full link for the downloads
 
 
@@ -167,6 +168,9 @@ class Env:
         e["UV_CACHE_DIR"] = str(self.install / "uv_cache")
         e["HF_HOME"] = str(self.install / "hf")
         e["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+        # Package and model downloads now share the line. uv gives up on a file after 30 s without data, which the
+        # model download can cause (first Linux test: the torch install failed that way, then passed by hand).
+        e.setdefault("UV_HTTP_TIMEOUT", "300")
         e["PYTHONUNBUFFERED"] = "1"
         e["PATH"] = str(self.ffmpeg_dir) + os.pathsep + e.get("PATH", "")
         e.pop("SSW_WORKER_KEY", None)
@@ -237,9 +241,15 @@ def _run(env, step, cmd, extra_env=None, cwd=None):
                 frac = min(100, int(m[-1])) / 100
         env.progress(step, frac, ln[-200:])
 
-    rc = env.run(cmd, env.tool_env(extra_env), cwd, on_line)
-    if rc != 0:
-        raise SetupError(f"{LABELS[step]} failed (exit {rc}). See the lines above.")
+    # Downloads fail for passing reasons (a stalled connection, a busy server). Every command here picks up where it
+    # stopped (uv keeps finished files, huggingface_hub resumes part files), so trying again costs little.
+    for attempt in range(1, RUN_TRIES + 1):
+        rc = env.run(cmd, env.tool_env(extra_env), cwd, on_line)
+        if rc == 0:
+            return
+        if attempt < RUN_TRIES:
+            env.progress(step, None, f"That did not finish (exit {rc}). Trying again ({attempt + 1} of {RUN_TRIES})...")
+    raise SetupError(f"{LABELS[step]} failed (exit {rc}). See the lines above.")
 
 
 def _extract(archive, dest):
