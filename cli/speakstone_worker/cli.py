@@ -13,7 +13,7 @@ import time
 from rich.console import Console
 from rich.live import Live
 
-from . import APP_NAME, __version__, board, enroll as enroll_mod, idle, paths, service, setup, stats
+from . import APP_NAME, __version__, board, enroll as enroll_mod, idle, paths, service, setup, stats, uninstall
 from .keys import KeyReader, drain
 from .runner import WorkerGroup, install_close_handlers
 from .settings import Settings, in_pause_window, parse_hhmm
@@ -262,10 +262,14 @@ def settings_menu(console, install, st):
         console.print(f"  [{board.GOLD}][3][/] Uninstall the service")
         console.print(f"  [{board.GOLD}][4][/] Show my worker label: [bold]{worker_label(install) or '(not set up yet)'}[/]")
         console.print(f"  [{board.GOLD}][5][/] Workers on this card: [bold]{st['workers']}[/]")
+        console.print(f"  [{board.GOLD}][6][/] Remove SpeakStone Worker from this PC (deletes every downloaded file)")
         console.print(f"  [{board.GOLD}][B][/] Back")
         with KeyReader() as keys:
             k = keys.wait()
-        if k == "1":
+        if k == "6":
+            if remove_program(console, install):
+                return "exit"
+        elif k == "1":
             console.show_cursor(True)
             v = input("Minutes of no keyboard or mouse use before starting (1-240): ").strip()
             if v.isdigit() and 1 <= int(v) <= 240:
@@ -289,6 +293,36 @@ def settings_menu(console, install, st):
             time.sleep(2)
         elif k in ("b", "q", "\x1b"):
             return
+
+
+def stop_all_workers(install, wait=8.0):
+    group = WorkerGroup(install, 2)
+    found = group.find_existing()
+    if found:
+        group.adopt(found)
+        group.shutdown_fast(wait=wait)
+
+
+def remove_program(console, install, ask=input, remover=uninstall.remove_everything, sleep=time.sleep):
+    """Settings > 6. True when the user went ahead (the app then exits)."""
+    gb = uninstall.folder_bytes(install) / 1e9
+    console.print(f"\nThis stops the workers, removes the service and deletes [bold]{install}[/] ({gb:.1f} GB):")
+    console.print("Python, the voice engine, the model files, download caches, logs, settings and this PC's worker key.")
+    console.print("Running the app again later downloads everything again.")
+    console.show_cursor(True)
+    if ask("Type DELETE to go ahead, anything else to cancel: ").strip() != "DELETE":
+        console.print("Nothing was deleted.")
+        sleep(1.5)
+        return False
+    console.print("Deleting...")
+    r = remover(install, stop_workers=lambda: stop_all_workers(install), remove_service=service.uninstall)
+    if r["ok"]:
+        console.print(f"Done. {r['freed'] / 1e9:.1f} GB freed. You can now delete the SpeakStoneWorker program file itself.")
+    else:
+        console.print(f"Some files could not be deleted ({r['freed'] / 1e9:.1f} GB freed). Close other programs "
+                      f"using them, then delete this folder by hand: {r['left']}")
+    ask("Press Enter to close.")
+    return True
 
 
 def set_workers(console, install, st, gpu_reader=None, enroll_runner=None):
@@ -414,7 +448,8 @@ def main(argv=None):
                                   f"{st['idle_minutes']} minutes." if ok else "Could not install the service.")
                 time.sleep(2)
             elif choice == "3":
-                settings_menu(console, install, st)
+                if settings_menu(console, install, st) == "exit":
+                    return 0
             elif choice in ("q", "\x1b"):
                 return 0
             choice = None

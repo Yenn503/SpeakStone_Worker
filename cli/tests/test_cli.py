@@ -847,3 +847,60 @@ def test_net_meter_survives_wrap_and_reset_never_negative():
     m.sample()                                   # +1.0 MB
     job, session = m.figures("j")
     assert session == pytest.approx(4.6) and job == pytest.approx(4.6) and job >= 0
+
+
+# ---- model cache folder (every job fetched the extra model files again, 2026-11-12) ----
+def _engine_funcs():
+    import ast
+    src = (Path(__file__).resolve().parents[2] / "indextts2_worker.py").read_text(encoding="utf-8")
+    ns = {"os": os, "Path": Path}
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.FunctionDef) and node.name in ("hf_cache_dir", "pin_hf_cache"):
+            exec(compile(ast.Module([node], []), "indextts2_worker.py", "exec"), ns)
+    return src, ns
+
+
+def test_model_cache_is_absolute_and_pinned_before_the_engine_import(tmp_path):
+    src, ns = _engine_funcs()
+    env = {"HF_HOME": str(tmp_path / "hf")}
+    got = ns["pin_hf_cache"](env)
+    assert got == str((tmp_path / "hf" / "hub").resolve()) and env["HF_HUB_CACHE"] == got and Path(got).is_absolute()
+    assert ns["pin_hf_cache"]({"HF_HOME": "x", "HF_HUB_CACHE": str(tmp_path / "c")}) == str((tmp_path / "c").resolve())
+    assert ns["pin_hf_cache"]({}) is None
+    assert src.index("HF_CACHE = pin_hf_cache()") < src.index("import indextts.infer_v2")
+
+
+def test_runner_sets_an_absolute_model_cache(tmp_path):
+    from speakstone_worker.runner import WorkerRunner
+    e = WorkerRunner(tmp_path).environment({})
+    assert e["HF_HUB_CACHE"] == str(tmp_path / "hf" / "hub")
+    assert WorkerRunner(tmp_path, index=2).environment({})["HF_HUB_CACHE"] == e["HF_HUB_CACHE"]
+
+
+# ---- remove the program ----
+def test_remove_everything_deletes_only_an_install_folder(tmp_path):
+    from speakstone_worker import uninstall
+    other = tmp_path / "Documents"
+    other.mkdir()
+    (other / "a.txt").write_text("x")
+    assert uninstall.remove_everything(other)["ok"] is False and (other / "a.txt").exists()
+    inst = tmp_path / "SpeakStoneWorker"
+    (inst / "hf" / "hub").mkdir(parents=True)
+    (inst / "setup_state.json").write_text("{}")
+    (inst / "hf" / "hub" / "big.bin").write_bytes(b"0" * 5000)
+    order = []
+    r = uninstall.remove_everything(inst, stop_workers=lambda: order.append("stop"),
+                                    remove_service=lambda: order.append("service"))
+    assert r["ok"] and r["freed"] >= 5000 and not inst.exists() and order == ["stop", "service"]
+
+
+def test_remove_program_needs_the_word_delete(tmp_path):
+    from speakstone_worker import cli
+    con = Console(file=io.StringIO(), width=120)
+    calls = []
+    assert cli.remove_program(con, tmp_path, ask=lambda _p: "yes", remover=lambda *a, **k: calls.append(1),
+                              sleep=lambda _s: None) is False
+    assert not calls
+    assert cli.remove_program(con, tmp_path, ask=lambda _p: "DELETE",
+                              remover=lambda *a, **k: {"ok": True, "freed": 2e9, "left": ""}) is True
+    assert "2.0 GB freed" in con.file.getvalue()
