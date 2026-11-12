@@ -6,7 +6,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from . import APP_NAME, DISCLAIMER, TAGLINE, __version__
+from . import APP_NAME, TAGLINE, __version__
 from .stats import format_duration
 
 GOLD, PARCH, DIM, GREEN, AMBER, BIG, BG = "#e9bb4d", "#d4bb8c", "#7d6b52", "#8fb04a", "#e0962c", "bold #f6e3b0", "#14100c"
@@ -40,7 +40,6 @@ def menu_screen(service_installed=False, update_version=None):
     t = Text()
     t.append_text(banner())
     t.append("\n  " + TAGLINE + "\n", style=PARCH)
-    t.append("  " + DISCLAIMER + "\n", style=DIM)
     t.append(f"  {APP_NAME} {__version__}\n\n", style=DIM)
     items = [("1", "Start now", ""), ("2", "Uninstall the service" if service_installed else "Install as a service",
                                       "" if service_installed else "(runs when your PC is idle)"),

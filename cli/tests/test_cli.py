@@ -477,8 +477,9 @@ def test_menu_and_banner_wording():
     out = plain(board.menu_screen(), width=80)
     for needle in ("[1] Start now", "[2] Install as a service (runs when your PC is idle)", "[3] Settings", "[Q] Quit",
                    "Lend your graphics card to the voice-line queue.",
-                   "Unofficial; not affiliated with Blizzard Entertainment", "█████"):
+                   "█████"):
         assert needle in out, needle
+    assert "Blizzard" not in out                    # owner, 2026-11-12: not on the menu (the README still carries the line)
     low = out.lower() + plain(board.render_board(sample_state())).lower()
     for bad in (" ai ", "clone", "generated", "synthesis", "reference"):
         assert bad not in low
