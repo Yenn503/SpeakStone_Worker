@@ -308,7 +308,7 @@ def test_flow_from_source_or_unwritable_folder_only_reports(tmp_path, monkeypatc
 def test_flow_updates_a_copy_run_from_another_folder(tmp_path):
     """1.2.0-1.2.2 only updated the installed copy: people running the downloaded file never updated."""
     called = []
-    f = make_flow(tmp_path, check_result=REL, apply_fn=lambda *a: called.append(a), in_app=False)
+    f = make_flow(tmp_path, check_result=REL, apply_fn=lambda *a, **k: called.append(a), in_app=False)
     assert f.check() == REL and f.can_apply() == (True, "")
     staged = tmp_path / "SpeakStoneWorker.new.exe"
     staged.write_bytes(b"y")
@@ -1101,3 +1101,38 @@ def test_folder_writable_and_error_text(tmp_path):
     assert update.describe_error(urllib.error.HTTPError("https://x", 403, "rate limit exceeded", None, None)).startswith("HTTPError 403")
     t = update.describe_error(urllib.error.URLError(TimeoutError("timed out")))
     assert t.startswith("URLError") and "TimeoutError" in t and "https://" not in t
+
+
+
+def test_an_old_copy_still_running_does_not_block_the_next_swap_or_install(tmp_path):
+    """A window left open from before the last update keeps `.old` locked: Windows will not delete it. The next update
+    and the service install both failed on that PC until every old window was closed."""
+    exe = tmp_path / "SpeakStoneWorker.exe"
+    exe.write_bytes(b"current")
+    locked = update.old_name(exe)
+    locked.write_bytes(b"still running")
+
+    def remove(path):                                   # the locked file cannot be deleted
+        if Path(path) != locked:
+            update._remove(path)
+    assert update.free_old_name(exe, remove).name == "SpeakStoneWorker.exe.old2"
+    new = tmp_path / "SpeakStoneWorker.new.exe"
+    new.write_bytes(b"newer")
+    started = []
+    update.swap_windows(exe, new, ["--background"], remove=remove, spawn=started.append, exit_fn=lambda c: None)
+    assert exe.read_bytes() == b"newer" and (tmp_path / "SpeakStoneWorker.exe.old2").read_bytes() == b"current"
+    assert locked.read_bytes() == b"still running" and len(started) == 1
+    # the service install into a folder whose copy is in use and whose .old is locked
+    src = tmp_path / "dl" / "SpeakStoneWorker.exe"
+    src.parent.mkdir()
+    src.write_bytes(b"downloaded")
+    import os as _os
+
+    def replace(a, b):                                  # the running copy cannot be overwritten, only renamed
+        if Path(b) == exe and exe.exists():
+            raise OSError("in use")
+        _os.replace(a, b)
+    update.install_copy(src, exe, replace=replace, remove=remove)
+    assert exe.read_bytes() == b"downloaded" and (tmp_path / "SpeakStoneWorker.exe.old2").read_bytes() == b"newer"
+    update.cleanup_old(exe)                             # nothing is running in the test: every old copy goes
+    assert not list(tmp_path.glob("*.old*"))

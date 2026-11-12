@@ -178,6 +178,21 @@ def old_name(exe):
     return exe.with_name(exe.name + ".old")
 
 
+def free_old_name(exe, remove=None):
+    """A name the running program can be moved aside to. `<name>.old` when it is free or can be deleted; when an earlier
+    old copy is still running (a window left open from before the last update) Windows will not delete it, so the next
+    free `<name>.old2`, `.old3`, ... is used. Without this, one forgotten open window blocked every later update and
+    every service install on that PC (seen 2026-11-12)."""
+    exe = Path(exe)
+    remove = remove or _remove
+    for n in range(1, 50):
+        cand = exe.with_name(exe.name + (".old" if n == 1 else f".old{n}"))
+        remove(cand)
+        if not cand.exists():
+            return cand
+    raise OSError("too many old copies of the program are still running; close its other windows")
+
+
 def self_run(cmd, timeout=60):
     env = dict(os.environ)
     env[RESET_ENV] = "1"
@@ -226,7 +241,9 @@ def _remove(path):
 def cleanup_old(exe):
     """At start: delete the `.old` and `.new` files an earlier swap or failed download left behind."""
     if exe:
-        _remove(old_name(exe))
+        exe = Path(exe)
+        for leftover in exe.parent.glob(exe.name + ".old*"):      # one still in use stays; it goes at a later start
+            _remove(leftover)
         _remove(staging_name(exe))
 
 
@@ -290,8 +307,8 @@ def swap_windows(exe, new, args, rename=os.rename, replace=os.replace, spawn=_sp
                  exit_fn=sys.exit):
     """A running exe can be renamed but not overwritten: move it to `.old`, put the new one in its place, start it,
     leave. If the second step fails the old name is put back and nothing has changed."""
-    exe, new, old = Path(exe), Path(new), old_name(exe)
-    remove(old)
+    exe, new = Path(exe), Path(new)
+    old = free_old_name(exe, remove)
     rename(exe, old)
     try:
         replace(new, exe)
@@ -339,8 +356,7 @@ def install_copy(src, dst, copy=shutil.copy2, replace=os.replace, rename=os.rena
         try:
             replace(tmp, dst)
         except OSError:
-            old = old_name(dst)
-            remove(old)
+            old = free_old_name(dst, remove)
             rename(dst, old)
             try:
                 replace(tmp, dst)
