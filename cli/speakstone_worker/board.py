@@ -36,11 +36,11 @@ def banner():
     return t
 
 
-def menu_screen(service_installed=False, update_version=None):
+def menu_screen(service_installed=False, update_version=None, label=""):
     t = Text()
     t.append_text(banner())
     t.append("\n  " + TAGLINE + "\n", style=PARCH)
-    t.append(f"  {APP_NAME} {__version__}\n\n", style=DIM)
+    t.append(f"  {APP_NAME} {__version__}" + (f" - {label}" if label else "") + "\n\n", style=DIM)
     items = [("1", "Start now", ""), ("2", "Uninstall the service" if service_installed else "Install as a service",
                                       "" if service_installed else "(runs when your PC is idle)"),
              ("3", "Settings", "")]
@@ -57,9 +57,9 @@ def menu_screen(service_installed=False, update_version=None):
     return t
 
 
-def menu_panel(service_installed=False, update_version=None):
+def menu_panel(service_installed=False, update_version=None, label=""):
     """The whole menu as ONE panel, printed once; then a single key is read."""
-    return Panel(menu_screen(service_installed, update_version), title=f"[{GOLD}]MENU[/]", title_align="left", border_style=GOLD,
+    return Panel(menu_screen(service_installed, update_version, label), title=f"[{GOLD}]MENU[/]", title_align="left", border_style=GOLD,
                  box=box.SQUARE, style=f"on {BG}", padding=(0, 1))
 
 
@@ -183,7 +183,8 @@ def render_board(s):
     foot.append("stop and exit", style=DIM)
     foot.append("   [M] ", style=GOLD)
     foot.append("menu", style=DIM)
-    foot.append(f"   v{__version__}", style=DIM)
+    label = s.get("label")
+    foot.append(f"   v{__version__}" + (f" - {label}" if label else ""), style=DIM)
     if s.get("update"):
         foot.append(f" (update {s['update']} available)", style=AMBER)
     if s.get("net"):

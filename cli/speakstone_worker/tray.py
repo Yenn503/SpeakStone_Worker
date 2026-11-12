@@ -28,9 +28,9 @@ PAUSE_CHOICES = (("pause_15", "15 minutes", 15), ("pause_60", "1 hour", 60), ("p
                  ("pause_240", "4 hours", 240), ("pause_0", "Until I resume", 0))
 
 
-def build_menu(version, status, paused, settings, update_version=None):
+def build_menu(version, status, paused, settings, update_version=None, label=""):
     """-> list of Item. `settings` maps the toggle keys above to True/False."""
-    items = [Item("title", f"{APP_NAME} {version}", False, None, False),
+    items = [Item("title", f"{APP_NAME} {version}" + (f" - {label}" if label else ""), False, None, False),
              Item("status", status, False, None, False),
              SEPARATOR,
              (Item("resume", "Resume", True, None, False) if paused else
@@ -77,11 +77,11 @@ class Tray:
 
     def _state(self):
         s = self.get_state()
-        return s["status"], s["paused"], dict(s["settings"]), s.get("update_version")
+        return s["status"], s["paused"], dict(s["settings"]), s.get("update_version"), s.get("label", "")
 
     def model(self):
-        status, paused, settings, upd = self._state()
-        return build_menu(self.version, status, paused, settings, upd)
+        status, paused, settings, upd, label = self._state()
+        return build_menu(self.version, status, paused, settings, upd, label)
 
     def _run(self, key):
         def call(icon=None, item=None):

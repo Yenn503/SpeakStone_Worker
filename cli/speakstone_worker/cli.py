@@ -14,7 +14,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.live import Live
 
-from . import (APP_NAME, __version__, board, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
+from . import (APP_NAME, __version__, board, identity, control as control_mod, enroll as enroll_mod, idle, paths, service, setup,
                stats, tray as tray_mod, uninstall, update)
 from .keys import KeyReader, drain
 from .runner import WorkerGroup, install_close_handlers
@@ -99,10 +99,15 @@ def worker_version(install):
 
 
 def worker_label(install):
-    try:
-        return json.loads((install / "enrolled.json").read_text(encoding="utf-8")).get("label") or ""
-    except (OSError, ValueError):
-        return ""
+    return identity.label_of(install)
+
+
+def ask_site_for_label(install, wait=identity.TIMEOUT, opener=None):
+    """Fill in the label from the site when it is unknown or a day old; never longer than `wait` seconds, silent."""
+    kw = {"opener": opener} if opener else {}
+    t = threading.Thread(target=lambda: identity.refresh(install, paths.api_base(), **kw), daemon=True)
+    t.start()
+    t.join(wait)
 
 
 # ---------------------------------------------------------------- setup with a progress board
@@ -226,7 +231,8 @@ class Collector:
         self._stop = True
 
 
-def board_state(install, queue, gpu, state, started, now=None, events=None, workers=1, net=None, update_version=None):
+def board_state(install, queue, gpu, state, started, now=None, events=None, workers=1, net=None, update_version=None,
+                label=""):
     now = now or time.time()
     if events is not None:
         s = stats.summarize(events, now)
@@ -235,7 +241,7 @@ def board_state(install, queue, gpu, state, started, now=None, events=None, work
         s = stats.merge_summaries([stats.summarize(stats.read_events(d), now) for d in dirs])
     s["workers"] = workers
     s["net"] = net.figures(s.get("job")) if net else None
-    s["queue"], s["gpu"], s["state"], s["update"] = queue, gpu, state, update_version
+    s["queue"], s["gpu"], s["state"], s["update"], s["label"] = queue, gpu, state, update_version, label
     s["time_left"] = stats.time_left(queue, s["words_hour"], s["lines_hour"])
     s["since_label"] = time.strftime("%H:%M", time.localtime(s["first_today"] or started))
     if s["making"]:
@@ -281,7 +287,7 @@ def start_now(console, install, settings, flow=None):
                     gpu, last_gpu = monitor.read(), time.time()
                 state = "paused" if paused else ("stopped" if not runner.running else "idle")
                 view = board_state(install, col.queue, gpu, state, started, workers=runner.count, net=net,
-                                   update_version=flow.version if flow else None)
+                                   update_version=flow.version if flow else None, label=worker_label(install))
                 view["pause_choice"] = choosing
                 view["paused_until"] = control_mod.until_label(paused_until) if paused and paused_until else None
                 # Redraw only every 5 s or when something changed: a 4/s full-screen redraw flickered (owner 2026-11-11).
@@ -326,6 +332,7 @@ def start_now(console, install, settings, flow=None):
 
 # ---------------------------------------------------------------- settings
 def settings_menu(console, install, st):
+    ask_site_for_label(install)
     while True:
         fresh_screen(console)
         console.print(f"\n[{board.GOLD}]SETTINGS[/]")
@@ -333,7 +340,7 @@ def settings_menu(console, install, st):
         sched = f"{st['pause_from']} - {st['pause_to']}" if st["pause_from"] and st["pause_to"] else "none"
         console.print(f"  [{board.GOLD}][2][/] Daily pause (no work in this window): [bold]{sched}[/]")
         console.print(f"  [{board.GOLD}][3][/] Uninstall the service")
-        console.print(f"  [{board.GOLD}][4][/] Show my worker label: [bold]{worker_label(install) or '(not set up yet)'}[/]")
+        console.print(f"  [{board.GOLD}][4][/] Worker label: [bold]{identity.describe(install)}[/]")
         console.print(f"  [{board.GOLD}][5][/] Workers on this card: [bold]{st['workers']}[/]")
         console.print(f"  [{board.GOLD}][6][/] Remove SpeakStone Worker from this PC (deletes every downloaded file)")
         console.print(f"  [{board.GOLD}][7][/] Update automatically: [bold]{'on' if st['auto_update'] else 'off'}[/]")
@@ -362,7 +369,7 @@ def settings_menu(console, install, st):
             console.print("Service removed." if service.uninstall() else "No service was installed.")
             time.sleep(1.5)
         elif k == "4":
-            console.print(f"Your worker label: {worker_label(install) or '(not set up yet)'}")
+            console.print(f"Worker label: {identity.describe(install)}")
             time.sleep(2)
         elif k == "5":
             console.print(set_workers(console, install, st))
@@ -636,8 +643,9 @@ def make_tray_actions(install, control, st, flow, open_board=tray_mod.open_board
             "quit": control.request_quit}
 
 
-def tray_state_reader(control, st):
+def tray_state_reader(control, st, install=""):
     return lambda: {"status": control.status, "paused": control.paused, "paused_until": control.paused_until,
+                    "label": identity.label_of(install),
                     "settings": {k: _setting(st, k) for k, _ in tray_mod.TOGGLES},
                     "update_version": control.update_version}
 
@@ -735,15 +743,18 @@ def _background(install, st, note, flow, tray_start, making):
         runner.shutdown_fast()
     install_close_handlers(on_close)
     gate = RestartGate()
-    tray = tray_start(__version__, tray_state_reader(control, st), make_tray_actions(install, control, st, flow),
+    tray = tray_start(__version__, tray_state_reader(control, st, install), make_tray_actions(install, control, st, flow),
                       paths.assets_dir() / "icon.png", log)
-    last_making, making_now = 0.0, False
+    last_making, making_now, next_label = 0.0, False, 0.0
     try:
         while not control.quit:
             try:
                 reload = getattr(st, "reload", None)
                 if reload:
                     reload()
+                if time.time() >= next_label:         # the label for the tray: once a day, every 30 minutes while unknown
+                    next_label = time.time() + (identity.REFRESH_SECONDS if worker_label(install) else identity.RETRY_SECONDS)
+                    ask_site_for_label(install)
                 pause_expiry_step(control, st)
                 background_tick(runner, st, gate=gate, control=control)    # first: claim at once when the rules allow
                 try:
@@ -788,6 +799,8 @@ def main(argv=None):
     flow = update.UpdateFlow(log=lambda text: log_background_error(install, text), app_exe=paths.app_exe(), args=[])
     update.cleanup_old(flow.exe)
     looker = None
+    labeller = threading.Thread(target=lambda: identity.refresh(install, paths.api_base()), daemon=True)
+    labeller.start()                                   # the worker's label, when it is not known yet
     if not update.disabled():                          # a short, silent look in the background; never blocks the menu
         looker = threading.Thread(target=flow.check, daemon=True)
         looker.start()
@@ -798,6 +811,7 @@ def main(argv=None):
             if choice is None:
                 if looker:
                     looker.join(1.5)                   # the first menu waits a moment for the answer, no longer
+                    labeller.join(0.5)
                     looker = None
                 if flow.release and not auto_tried and st["auto_update"] and flow.can_apply()[0]:
                     auto_tried = True
@@ -805,7 +819,7 @@ def main(argv=None):
                     console.print(flow.apply())        # does not return when it worked
                     time.sleep(2)
                 fresh_screen(console)
-                console.print(board.menu_panel(service.is_installed(), flow.version))
+                console.print(board.menu_panel(service.is_installed(), flow.version, worker_label(install)))
                 with KeyReader() as keys:
                     choice = keys.wait()
             if choice == "u" and flow.release:
