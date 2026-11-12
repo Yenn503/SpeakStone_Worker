@@ -133,9 +133,25 @@ def check(current=__version__, env=None, platform=None, get=http_get):
     except UpdateError:
         raise
     except (OSError, ValueError, urllib.error.URLError) as e:
-        raise UpdateError(f"could not reach the release page ({type(e).__name__})")
+        raise UpdateError(f"could not reach the release page ({describe_error(e)})")
     rel = pick_release(data, platform)
     return rel if is_newer(rel.version, current) else None
+
+
+def describe_error(e):
+    """A short reason for the log: the kind of error, the HTTP status if any, and the cause (a link is never included).
+    'URLError' alone told us nothing when checks failed for 20 minutes on one PC."""
+    kind = type(e).__name__
+    code = getattr(e, "code", None)
+    reason = getattr(e, "reason", None)
+    text = kind + (f" {code}" if isinstance(code, int) else "")
+    if reason is not None and not isinstance(reason, str):
+        reason = f"{type(reason).__name__}: {reason}"
+    if reason:
+        text += f": {str(reason)[:120]}"
+    elif not isinstance(code, int) and str(e):
+        text += f": {str(e)[:120]}"
+    return text
 
 
 def parse_fingerprint(text):
@@ -197,7 +213,7 @@ def fetch_verified(release, exe, get=http_get, download=http_download, run=self_
         raise
     except (OSError, urllib.error.URLError, subprocess.SubprocessError) as e:
         _remove(new)
-        raise UpdateError(f"the download failed ({type(e).__name__})")
+        raise UpdateError(f"the download failed ({describe_error(e)})")
 
 
 def _remove(path):
@@ -221,12 +237,28 @@ def same_file(a, b):
         return False
 
 
-def can_self_update(frozen, exe, app_exe):
-    """(True, "") or (False, why). Only the frozen program running from its own install folder swaps itself."""
+def folder_writable(folder, mkstemp=None):
+    """Can a file be made beside the program? (Needed for the new file and for renaming the running one.)"""
+    import tempfile
+    try:
+        fd, name = (mkstemp or tempfile.mkstemp)(prefix=".ssw_write_test_", dir=str(folder))
+        os.close(fd)
+        os.remove(name)
+        return True
+    except OSError:
+        return False
+
+
+def can_self_update(frozen, exe, app_exe=None, writable=None):
+    """(True, "") or (False, why). The frozen program swaps itself wherever it was started from, as long as it can write
+    beside itself. Until 1.2.2 this was only allowed from the program's own install folder: everyone who ran the file
+    they had downloaded was told "update available" for ever and never updated. `app_exe` is kept for callers."""
     if not frozen:
         return False, "running from source"
-    if not exe or not same_file(exe, app_exe):
-        return False, "not running from the program's own folder"
+    if not exe:
+        return False, "the program's own file is not known"
+    if not (writable or folder_writable)(Path(exe).parent):
+        return False, "cannot write in the program's folder (move the program to a folder of your own)"
     return True, ""
 
 

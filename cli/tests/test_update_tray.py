@@ -25,7 +25,7 @@ def release_json(tag="v1.3.0", names=("SpeakStoneWorker-windows.exe", "SpeakSton
 
 # ------------------------------------------------------------------ version and asset choice
 def test_version_is_shown_and_bumped():
-    assert __version__ == "1.2.2"
+    assert __version__ == "1.2.3"
     assert f"{APP_NAME} {__version__}" in board.menu_screen().plain
     assert cli.window_title() == f"{APP_NAME} {__version__}"
     assert "Update now" in board.menu_screen(False, "1.3.0").plain
@@ -271,7 +271,10 @@ def test_only_frozen_in_the_install_folder_swaps(tmp_path):
     other.write_bytes(b"x")
     assert update.can_self_update(True, app, app) == (True, "")
     assert not update.can_self_update(False, app, app)[0]
-    assert not update.can_self_update(True, other, app)[0]
+    # from any folder it can write in (1.2.3): people run the file they downloaded, not the installed copy
+    assert update.can_self_update(True, other, app, writable=lambda d: True) == (True, "")
+    ok, why = update.can_self_update(True, other, app, writable=lambda d: False)
+    assert not ok and "cannot write" in why
 
 
 def make_flow(tmp_path, frozen=True, in_app=True, check_result=None, apply_fn=None, log=None):
@@ -291,12 +294,27 @@ def make_flow(tmp_path, frozen=True, in_app=True, check_result=None, apply_fn=No
 REL = update.Release("1.3.0", GOOD + "a", GOOD + "a.sha256")
 
 
-def test_flow_from_source_or_other_folder_only_reports(tmp_path):
+def test_flow_from_source_or_unwritable_folder_only_reports(tmp_path, monkeypatch):
     called = []
-    for kw in ({"frozen": False}, {"in_app": False}):
-        f = make_flow(tmp_path, check_result=REL, apply_fn=lambda *a: called.append(a), **kw)
-        assert f.check() == REL
-        assert "1.3.0 is available" in f.apply() and called == []
+    f = make_flow(tmp_path, check_result=REL, apply_fn=lambda *a: called.append(a), frozen=False)
+    assert f.check() == REL
+    assert "1.3.0 is available" in f.apply() and called == []
+    monkeypatch.setattr(update, "folder_writable", lambda d, mkstemp=None: False)
+    f = make_flow(tmp_path, check_result=REL, apply_fn=lambda *a: called.append(a), in_app=False)
+    assert f.check() == REL
+    assert "1.3.0 is available" in f.apply() and called == []
+
+
+def test_flow_updates_a_copy_run_from_another_folder(tmp_path):
+    """1.2.0-1.2.2 only updated the installed copy: people running the downloaded file never updated."""
+    called = []
+    f = make_flow(tmp_path, check_result=REL, apply_fn=lambda *a: called.append(a), in_app=False)
+    assert f.check() == REL and f.can_apply() == (True, "")
+    staged = tmp_path / "SpeakStoneWorker.new.exe"
+    staged.write_bytes(b"y")
+    f.fetch_fn = lambda rel, exe: staged
+    f.apply()
+    assert len(called) == 1
 
 
 def test_flow_failed_check_is_one_log_line_and_silent(tmp_path):
@@ -419,6 +437,7 @@ def test_update_step_respects_the_off_switch_and_ineligible_copy(tmp_path, monke
     assert cli.update_step(f, c, st, DrainRunner()) is False and ev == []        # SSW_NO_UPDATE=1 from conftest
     monkeypatch.delenv("SSW_NO_UPDATE")
     logs = []
+    monkeypatch.setattr(update, "folder_writable", lambda d, mkstemp=None: False)
     f, c, st, ev = step_setup(tmp_path, in_app=False, log=logs.append)
     c.request_check()
     assert cli.update_step(f, c, st, DrainRunner()) is False and ev == []
@@ -1072,3 +1091,13 @@ def test_paths_app_exe_is_inside_the_data_folder():
     from speakstone_worker import paths
     assert paths.app_exe({"LOCALAPPDATA": "C:/L", "XDG_DATA_HOME": "/x"}).parent.name == "app"
     assert (paths.assets_dir() / "icon.png").exists() and (paths.assets_dir() / "icon.ico").exists()
+
+
+
+def test_folder_writable_and_error_text(tmp_path):
+    import urllib.error
+    assert update.folder_writable(tmp_path) and not list(tmp_path.iterdir())
+    assert not update.folder_writable(tmp_path / "missing")
+    assert update.describe_error(urllib.error.HTTPError("https://x", 403, "rate limit exceeded", None, None)).startswith("HTTPError 403")
+    t = update.describe_error(urllib.error.URLError(TimeoutError("timed out")))
+    assert t.startswith("URLError") and "TimeoutError" in t and "https://" not in t
