@@ -1283,3 +1283,19 @@ def test_background_survives_a_failing_tick_and_logs_it(tmp_path, monkeypatch):
     assert cli.background(tmp_path, {"workers": 1}) == 0
     assert len(calls) == 2
     assert "RuntimeError: odd" in (tmp_path / "work" / "logs" / "background.log").read_text()
+
+
+def test_batch_lines_are_grouped_by_voice_sample():
+    """A voice's lines sit together (the engine redoes its voice setup on every change of sample), nothing is lost."""
+    import ast
+    src = (Path(__file__).resolve().parents[2] / "indextts2_worker.py").read_text(encoding="utf-8")
+    ns = {}
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "by_voice":
+            exec(compile(ast.Module([node], []), "indextts2_worker.py", "exec"), ns)
+    rows = [({"canonical_reference_clip": v, "sound_file": f"{i}.ogg"}, f"fp{i}") for i, v in enumerate("ABACBA")]
+    got = ns["by_voice"](rows)
+    assert [r["canonical_reference_clip"] for r, _ in got] == list("AAABBC")
+    assert [r["sound_file"] for r, _ in got] == ["0.ogg", "2.ogg", "5.ogg", "1.ogg", "4.ogg", "3.ogg"]
+    assert sorted(fp for _, fp in got) == sorted(fp for _, fp in rows)
+    assert ns["by_voice"]([]) == []

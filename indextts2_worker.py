@@ -276,6 +276,16 @@ def prepare_reference_cached(refs_dir, ref_clip, cache_dir):
     return out
 
 
+def by_voice(pending):
+    """Lines that share a voice sample next to each other, first-seen voice first, each voice's lines in their own
+    order. The engine keeps the last voice sample's setup and redoes it whenever the sample changes, so a batch that
+    jumps between voices pays for that setup again and again. The seed is set per line, so the order changes no take."""
+    first = {}
+    for i, (r, _) in enumerate(pending):
+        first.setdefault(r["canonical_reference_clip"], i)
+    return sorted(pending, key=lambda p: first[p[0]["canonical_reference_clip"]])
+
+
 def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cuda", ref_cache=None):
     """Make one batch file. -> exit code (0 all made or held, 1 a failure). `tts` is a loaded model, or None to load
     one only if a line needs making (the one-shot command). `ref_cache` is a folder that keeps converted references
@@ -331,6 +341,7 @@ def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cu
             held += 1
             continue
         pending.append((r, fp))
+    pending = by_voice(pending)
     print(f"[IndexTTS-2] {len(pending)} to make, {skipped} already made, {held} held by QC", flush=True)
 
     done = failed = 0
