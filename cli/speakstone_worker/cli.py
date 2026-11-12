@@ -81,7 +81,20 @@ def set_title(text, platform=None, kernel32=None, write=None):
         pass
 
 
-def attach_console(platform=None, stdout=None, opener=open, set_handle=None):
+def output_is_console():
+    """Windows: does this program's standard output really end at a console window? `isatty()` cannot tell: it is also
+    True for the NUL device, which is exactly where a restart from 1.2.4 or older sends the output."""
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.GetStdHandle.restype = ctypes.c_void_p
+        k32.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+        mode = ctypes.c_ulong(0)
+        return bool(k32.GetConsoleMode(k32.GetStdHandle(0xFFFFFFF5), ctypes.byref(mode)))
+    except Exception:
+        return True                                    # cannot tell: change nothing
+
+
+def attach_console(platform=None, is_console=None, opener=open, set_handle=None):
     """Windows: when this program has a console window but its output goes nowhere, point output and input at the
     window. Versions up to 1.2.4 restart the program after an update with its output thrown away, so the first start
     of ANY newer version from one of those is an empty black window unless the new version repairs it itself.
@@ -89,12 +102,8 @@ def attach_console(platform=None, stdout=None, opener=open, set_handle=None):
     platform = platform or sys.platform
     if platform != "win32":
         return False
-    out = sys.stdout if stdout is None else stdout
-    try:
-        if out is not None and out.isatty():
-            return False
-    except Exception:
-        pass
+    if (is_console or output_is_console)():
+        return False
     try:
         con_out = opener("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
         con_in = opener("CONIN$", "r", encoding="utf-8", errors="replace")

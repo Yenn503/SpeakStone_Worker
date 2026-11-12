@@ -1152,17 +1152,9 @@ def test_a_restarted_menu_window_keeps_its_output(monkeypatch):
     assert calls[0]["stdout"] == subprocess.DEVNULL and calls[0]["creationflags"] & 0x08
 
 
-def test_attach_console_repairs_output_sent_nowhere(monkeypatch):
+def test_attach_console_repairs_output_sent_nowhere():
     import io
     from speakstone_worker import cli
-
-    class Dead(io.StringIO):
-        def isatty(self):
-            return False
-
-    class Tty(io.StringIO):
-        def isatty(self):
-            return True
     opened, handles = [], []
 
     def opener(name, mode, **kw):
@@ -1170,13 +1162,13 @@ def test_attach_console_repairs_output_sent_nowhere(monkeypatch):
         return io.StringIO()
     old = (cli.sys.stdout, cli.sys.stderr, cli.sys.stdin)
     try:
-        assert cli.attach_console("linux", Dead()) is False and opened == []
-        assert cli.attach_console("win32", Tty()) is False and opened == []          # a normal start: nothing to do
-        assert cli.attach_console("win32", Dead(), opener, lambda which, stream: handles.append(which)) is True
+        assert cli.attach_console("linux", lambda: False) is False and opened == []
+        assert cli.attach_console("win32", lambda: True) is False and opened == []     # a normal start: nothing to do
+        assert cli.attach_console("win32", lambda: False, opener, lambda which, stream: handles.append(which)) is True
         assert opened == ["CONOUT$", "CONIN$"] and len(handles) == 3
 
         def no_console(name, mode, **kw):
             raise OSError("no console")
-        assert cli.attach_console("win32", Dead(), no_console) is False
+        assert cli.attach_console("win32", lambda: False, no_console) is False
     finally:
         cli.sys.stdout, cli.sys.stderr, cli.sys.stdin = old
