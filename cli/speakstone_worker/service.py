@@ -98,11 +98,28 @@ def _ok(runner, cmd):
         return False
 
 
-def install(data_dir, runner=subprocess.run, platform=None, unit_dir=None, **launch_kw):
+def own_copy(frozen=None, executable=None, target=None, copier=None):
+    """The program the service should run. A frozen program first copies itself into the app's own folder on the local
+    disk and the service points at that copy: started from a network share or a download folder, the log-on task
+    would otherwise depend on that place being there. From source nothing is copied (None). Raises OSError."""
+    from . import paths, update
+    frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+    if not frozen:
+        return None
+    return update.install_copy(executable or sys.executable, target or paths.app_exe(), **({"copy": copier} if copier else {}))
+
+
+def install(data_dir, runner=subprocess.run, platform=None, unit_dir=None, app_target=None, copier=None, **launch_kw):
     platform = platform or sys.platform
-    program, args = launch_command(**launch_kw)
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        copy = own_copy(launch_kw.get("frozen"), launch_kw.get("executable"), app_target, copier)
+    except OSError:
+        return False                                  # no copy, no service: never point the task at a share
+    if copy is not None:
+        launch_kw = dict(launch_kw, frozen=True, executable=str(copy))
+    program, args = launch_command(**launch_kw)
     if platform == "win32":
         xml = data_dir / "task.xml"
         xml.write_text(build_task_xml(*windowless(program, args)), encoding="utf-16")

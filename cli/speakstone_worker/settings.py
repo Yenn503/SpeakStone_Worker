@@ -13,6 +13,7 @@ DEFAULTS = {
     "block_fullscreen": True,
     "block_on_battery": True,
     "workers": 1,               # workers on this card: 1, or 2 on a 12 GB+ card with room
+    "auto_update": True,        # fetch and install a newer release by itself; off = only say one is available
 }
 _HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -27,6 +28,15 @@ class Settings:
                 self.data.update({k: d[k] for k in DEFAULTS if k in d})
         except (OSError, ValueError):
             pass
+
+    def reload(self):
+        """Read the file again, so a change made in another window (the menu, the tray) is seen by a running process."""
+        try:
+            d = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(d, dict):
+            self.data.update({k: d[k] for k in DEFAULTS if k in d})
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)

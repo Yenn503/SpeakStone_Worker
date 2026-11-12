@@ -28,3 +28,28 @@ def api_base(env=None):
     from . import DEFAULT_API_BASE
     env = os.environ if env is None else env
     return (env.get("SPEAKSTONE_API_BASE") or DEFAULT_API_BASE).rstrip("/")
+
+
+APP_EXE_NAME = "SpeakStoneWorker.exe"
+APP_BIN_NAME = "SpeakStoneWorker"
+
+
+def app_dir(env=None):
+    """The program's own folder on the local disk. The service and the updater use the copy in here, so a program
+    started from a download folder or a network share is never what the log-on task points at."""
+    return data_dir(env) / "app"
+
+
+def app_exe(env=None):
+    return app_dir(env) / (APP_EXE_NAME if is_windows() else APP_BIN_NAME)
+
+
+def running_exe():
+    """Path of the running one-file program, or None when running from source."""
+    return Path(sys.executable) if getattr(sys, "frozen", False) else None
+
+
+def assets_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / "assets"
+    return Path(__file__).resolve().parent / "assets"
