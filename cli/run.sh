@@ -1,5 +1,8 @@
 #!/bin/sh
-# Linux: needs Python 3.9+ and `pip install rich` (or use: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt)
+# Linux: makes a private venv (.venv) with the packages from requirements.txt on first run, then starts the app.
 cd "$(dirname "$0")" || exit 1
-if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python3; fi
-exec "$PY" -m speakstone_worker "$@"
+if [ ! -x .venv/bin/python ]; then
+  python3 -m venv .venv || exit 1
+  .venv/bin/pip install -q -r requirements.txt || exit 1
+fi
+exec .venv/bin/python -m speakstone_worker "$@"

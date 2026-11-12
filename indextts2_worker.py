@@ -7,6 +7,8 @@ Output  <sound_file>.ogg, 24 kHz mono Vorbis @ 32 kbps, levelled and encoded by 
         (imported: one level recipe for every clip), and the quality gate runpod_worker.qc_clip.
 Resume  generation_provenance.jsonl with a recipe fingerprint; a clip with a valid file and a matching record is skipped.
 Seed    the row's generation_seed, so a remake of unchanged text reproduces the same take (seed_salt changes it).
+Modes   one batch per process (--batch-file ...), or --serve: load the model once and make one batch per request read
+        from stdin (see serve()), so a run of jobs does not reload several GB of weights each time.
 
 Run it in the IndexTTS-2 Python environment; it needs the weights in INDEXTTS2_DIR (a plain folder, not the
 Hugging Face cache: that cache wants Windows symlinks, which an ordinary account may not create).
@@ -252,18 +254,36 @@ def load_model(device):
     return tts
 
 
-def main():
-    ap = argparse.ArgumentParser(description="IndexTTS-2 worker")
-    ap.add_argument("--batch-file", required=True)
-    ap.add_argument("--output-dir", required=True)
-    ap.add_argument("--references", default=str(rw.DEFAULT_REFS))
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument("--bitrate", default="32k")
-    a = ap.parse_args()
+def prepare_reference_cached(refs_dir, ref_clip, cache_dir):
+    """Serve mode: the converted wav outlives the job, so the next job with the same voice does not convert it again.
+    The name carries the source file's size and modification time, so a changed source never reuses an old wav. The
+    wav is written under a temporary name first: a process killed mid-convert must not leave half a file in the cache."""
+    src = Path(refs_dir) / ref_clip
+    st = src.stat()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out = cache_dir / f"{Path(ref_clip).stem}_{st.st_size}_{st.st_mtime_ns}.wav"
+    if not out.exists():
+        part = out.with_name(out.stem + f".{os.getpid()}.part.wav")
+        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-ac", "1", "-ar", "24000",
+                            str(part)], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            raise RuntimeError(f"reference convert failed for {ref_clip}: {r.stderr[-300:]}")
+        os.replace(str(part), str(out))
+    return out
 
-    batch = Path(a.batch_file)
-    out = Path(a.output_dir)
-    refs = Path(a.references)
+
+def run_batch(tts, batch_file, output_dir, references, bitrate="32k", device="cuda", ref_cache=None):
+    """Make one batch file. -> exit code (0 all made or held, 1 a failure). `tts` is a loaded model, or None to load
+    one only if a line needs making (the one-shot command). `ref_cache` is a folder that keeps converted references
+    between batches (serve mode); None keeps them in the batch's own temporary folder, as the one-shot command always
+    did. Paths are made absolute first: in serve mode the process does not run in the job's folder."""
+    batch = Path(batch_file).resolve()
+    out = Path(output_dir).resolve()
+    refs = Path(references).resolve()
     out.mkdir(parents=True, exist_ok=True)
     tmp = out / ".tmp_indextts2"
     tmp.mkdir(exist_ok=True)
@@ -302,7 +322,7 @@ def main():
     pending, skipped, held = [], 0, 0
     for r in rows:
         sf_name = r["sound_file"]
-        fp = recipe_fingerprint(r, revision, a.bitrate)
+        fp = recipe_fingerprint(r, revision, bitrate)
         final = out / sf_name
         if final.exists() and rw.is_valid_output(final) and prov.get(sf_name, {}).get("recipe_fingerprint") == fp:
             skipped += 1
@@ -317,10 +337,11 @@ def main():
     failures = []
     t_start = time.time()
     if pending:
-        if a.device == "cuda" and not torch.cuda.is_available():
-            print("[FATAL] CUDA requested but not available.", file=sys.stderr)
-            return 1
-        tts = load_model(a.device)
+        if tts is None:
+            if device == "cuda" and not torch.cuda.is_available():
+                print("[FATAL] CUDA requested but not available.", file=sys.stderr)
+                return 1
+            tts = load_model(device)
         host = socket.gethostname()
         with open(prov_path, "a", encoding="utf-8") as pf:
             lock = threading.Lock()
@@ -342,7 +363,7 @@ def main():
                     if peak > 1.0:
                         arr = arr / peak * 0.98
                     sf.write(str(wav_path), arr, sr)
-                    level = rw.apply_post_fx_and_encode(wav_path, ogg_path, row.get("post_af", ""), bitrate=a.bitrate,
+                    level = rw.apply_post_fx_and_encode(wav_path, ogg_path, row.get("post_af", ""), bitrate=bitrate,
                                                         shout="!" in (text or ""))
                     dur, osr, och = rw.get_audio_info(ogg_path)
                     if dur <= 0.05 or osr != rw.OUTPUT_SAMPLE_RATE or och != rw.OUTPUT_CHANNELS:
@@ -369,7 +390,7 @@ def main():
                            "model_engine": ENGINE, "model_revision": revision, "generation_seed": seed,
                            "line_emotion": row.get("line_emotion", ""), "emo_vector": vec, "emo_alpha": EMO_ALPHA if vec else None,
                            "num_beams": beams_for(vec),
-                           "post_af": row.get("post_af", ""), "bitrate": a.bitrate,
+                           "post_af": row.get("post_af", ""), "bitrate": bitrate,
                            "measured_lufs": (level or {}).get("measured_lufs"), "level": (level or {}).get("level"),
                            "level_recipe": (level or {}).get("level_recipe"), "duration_sec": round(dur, 3),
                            "gen_time_sec": round(gen, 3), "rtf": round(gen / dur, 3) if dur > 0 else 0.0,
@@ -405,7 +426,10 @@ def main():
                     torch.manual_seed(seed)
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed_all(seed)
-                    ref = prepare_reference(refs, row["canonical_reference_clip"], tmp / "refs")
+                    if ref_cache is not None:
+                        ref = prepare_reference_cached(refs, row["canonical_reference_clip"], Path(ref_cache))
+                    else:
+                        ref = prepare_reference(refs, row["canonical_reference_clip"], tmp / "refs")
                     parts = split_long_text(text)
                     if len(parts) <= 1:
                         kw = dict(spk_audio_prompt=str(ref), text=text, output_path=None, verbose=False)
@@ -473,6 +497,94 @@ def main():
         (out / f"failed_{batch.stem}_{ENGINE}.json").write_text(json.dumps(failures, indent=2), encoding="utf-8")
         return 1
     return 0
+
+
+READY_MARKER = "[ENGINE-READY]"
+DONE_MARKER = "[JOB-DONE]"
+REF_CACHE_DAYS = 14          # converted references unused this long are removed when the engine starts
+
+
+def _prune_ref_cache(cache_dir, days=REF_CACHE_DAYS):
+    """Keep the serve-mode reference cache from growing for ever: drop wavs not touched for `days` and any half-written
+    file a killed process left behind."""
+    cutoff = time.time() - days * 86400
+    try:
+        for e in os.scandir(cache_dir):
+            if e.is_file() and (".part." in e.name or e.stat().st_mtime < cutoff):
+                try:
+                    os.unlink(e.path)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def serve(device="cuda", ref_cache=None, stdin=None, load=None, runner=None):
+    """Load the model once, then make one batch per request line read from stdin, so a run of jobs does not pay the
+    several-GB model load each time. Protocol (one JSON object per line):
+        {"batch_file": ..., "output_dir": ..., "references": ..., "bitrate": ...}
+    Prints READY_MARKER once the model is loaded and "[JOB-DONE] rc=<n>" after each request; end of stdin is a clean
+    exit (0). Any exception that escapes a batch (a GPU fault, or anything unforeseen) ends the process (exit 3) after
+    its marker: the caller starts a fresh one for the next job, as the one-process-per-job mode always did.
+    `stdin`, `load` and `runner` are for tests."""
+    stdin = sys.stdin.buffer if stdin is None else stdin
+    runner = run_batch if runner is None else runner
+    cache = Path(ref_cache).resolve() if ref_cache else (Path.cwd() / "ref_wav_cache").resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    _prune_ref_cache(cache)
+    if load is None:
+        if device == "cuda" and not torch.cuda.is_available():
+            print("[FATAL] CUDA requested but not available.", file=sys.stderr, flush=True)
+            return 1
+        tts = load_model(device)
+    else:
+        tts = load()
+    print(READY_MARKER, flush=True)
+
+    def done(rc):
+        sys.stderr.flush()                       # everything the batch printed comes before its marker
+        print(f"{DONE_MARKER} rc={rc}", flush=True)
+
+    for raw in iter(stdin.readline, b""):
+        line = raw.decode("utf-8", "replace").strip() if isinstance(raw, bytes) else str(raw).strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            if not isinstance(req, dict) or not all(isinstance(req.get(k), str) and req.get(k)
+                                                    for k in ("batch_file", "output_dir", "references")):
+                raise ValueError("batch_file, output_dir and references are required")
+        except ValueError as e:
+            print(f"[serve] request refused: {e}", file=sys.stderr)
+            done(2)
+            continue
+        try:
+            rc = runner(tts, req["batch_file"], req["output_dir"], req["references"], str(req.get("bitrate") or "32k"),
+                        device=device, ref_cache=cache)
+        except BaseException:
+            import traceback
+            traceback.print_exc()
+            done(1)
+            return 3
+        done(int(rc or 0))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="IndexTTS-2 worker")
+    ap.add_argument("--batch-file")
+    ap.add_argument("--output-dir")
+    ap.add_argument("--references", default=str(rw.DEFAULT_REFS))
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--bitrate", default="32k")
+    ap.add_argument("--serve", action="store_true", help="keep the model loaded; read one batch request per stdin line")
+    ap.add_argument("--ref-cache", help="serve mode: folder that keeps converted references between batches")
+    a = ap.parse_args()
+    if a.serve:
+        return serve(a.device, a.ref_cache)
+    if not a.batch_file or not a.output_dir:
+        ap.error("--batch-file and --output-dir are required (or --serve)")
+    return run_batch(None, a.batch_file, a.output_dir, a.references, a.bitrate, device=a.device)
 
 
 if __name__ == "__main__":

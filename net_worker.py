@@ -16,11 +16,14 @@ Exit codes: 0 stopped, 2 config error, 3 key refused (401), 4 protocol refused (
 from __future__ import annotations
 
 import argparse
+import email.utils
 import getpass
 import hashlib
 import json
 import os
 import platform
+import queue
+import random
 import re
 import shutil
 import signal
@@ -32,18 +35,32 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from datetime import datetime, timezone
 from pathlib import Path
 
 # ----------------------------------------------------------------------------------------------- constants
 PROTOCOL = 1
-WORKER_VERSION = "1.0.1"
+WORKER_VERSION = "1.1.0"
 RECIPE = "idx2-v1"
 ENGINE = "indextts2"
 DEFAULT_API_BASE = "https://speakstone.beanw.co.uk"
 HEARTBEAT_SECONDS = 60
-IDLE_BASE_SECONDS = 60
-IDLE_CAP_SECONDS = 300
+# Empty queue: the site's retry_after_seconds when it gives one, else 15 s doubling; never more than 60 s, so new work
+# is picked up within a minute. +-20% jitter keeps many workers from asking at the same moment.
+IDLE_BASE_SECONDS = 15
+IDLE_CAP_SECONDS = 60
+IDLE_JITTER = 0.2
+RETRY_AFTER_CAP = 300     # longest wait a 429 Retry-After can ask for
+# Keep the engine loaded between jobs (SSW_ENGINE_KEEP=0 turns it off). It is restarted after this many runs and after
+# this long with no job, and always when local GPU work wants the card, so the memory is not held for ever.
+ENGINE_MAX_JOBS = 50
+ENGINE_IDLE_SECONDS = 300
+ENGINE_READY_MARKER = "[ENGINE-READY]"
+ENGINE_DONE_RE = re.compile(r"^\[JOB-DONE\] rc=(-?\d+)\s*$")
+UPLOAD_THREADS = 4
+FINISH_GRACE_SECONDS = 120   # a finished job may still upload and complete for this long after a stop is asked for
 BACKOFF_START = 5
 BACKOFF_CAP = 300
 VRAM_POLL_SECONDS = 30
@@ -98,16 +115,51 @@ class LeaseLost(Exception):
 
 
 class NetError(Exception):
-    """Network failure or a transient server answer (5xx, 429): retried with backoff."""
+    """Network failure or a transient server answer (5xx, 429): retried with backoff. retry_after (seconds) is set
+    when the server said how long to wait."""
+    def __init__(self, message="", retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 _ERR_LINE = re.compile(r"^\s*(?:[\w.]+\.)?\w*(?:Error|Exception)\b:\s.*$")
-_HOME_PATHS = re.compile(r"(?i)(?:[a-z]:\\users\\[^\\/\s'\"]+|/home/[^/\s'\"]+|/users/[^/\s'\"]+|/root)(?=[\\/\s'\"]|$)")
+# Home folders in every spelling a Windows, WSL, macOS or Linux error message can carry: C:\Users\x and C:/Users/x,
+# /mnt/c/Users/x (WSL), /home/x, /Users/x, /root, and network shares (\\host\share, //host/share), which name a machine.
+_HOME_PATHS = re.compile(
+    r"(?i)(?:\\\\[^\\/\s'\"]+\\[^\\/\s'\"]+|//[^\\/\s'\"]+/[^\\/\s'\"]+|[a-z]:[\\/]users[\\/][^\\/\s'\"]+"
+    r"|/mnt/[a-z]/users/[^\\/\s'\"]+|/home/[^\\/\s'\"]+|/users/[^\\/\s'\"]+|/root)(?=[\\/\s'\":]|$)")
 
 
 def scrub_paths(text):
     """home-folder paths become ~ before an error line leaves the machine."""
     return _HOME_PATHS.sub("~", text)
+
+
+def _machine_names():
+    """This machine's host name (full and short) and the OS user name: they identify a volunteer, so they never go to
+    the site. Names under 3 characters are left alone, they would match inside ordinary words."""
+    names = set()
+    try:
+        host = socket.gethostname() or ""
+        names.update({host, host.split(".")[0]})
+    except Exception:
+        pass
+    for get in (getpass.getuser, lambda: os.environ.get("USERNAME", ""), lambda: os.environ.get("USER", "")):
+        try:
+            names.add(get() or "")
+        except Exception:
+            pass
+    return sorted((n for n in names if len(n) >= 3), key=len, reverse=True)
+
+
+def safe_msg(text, names=None):
+    """Text that is about to be sent to the site: every URL (presigned links are secrets, and no address is needed
+    there), home-folder paths, the host name and the user name are replaced. The local log keeps its own rules."""
+    s = _URL_RE.sub("<url>", str(text))
+    s = scrub_paths(s)
+    for n in (_machine_names() if names is None else names):
+        s = re.sub(r"(?i)(?<![A-Za-z0-9])" + re.escape(n) + r"(?![A-Za-z0-9])", "~", s)
+    return s
 
 
 def last_error_line(log_path, offset=0, max_bytes=65536):
@@ -344,6 +396,7 @@ class Config:
         self.need_free_mib = 5200
         self.yield_lock = ""            # path of another program's GPU lock
         self.synth_script = ""          # test-only override of indextts2_worker.py (SSW_SYNTH_SCRIPT)
+        self.engine_keep = True         # keep the engine loaded between jobs (SSW_ENGINE_KEEP=0: one process per job)
 
 
 def load_config(path=None, env=None, require_key=True):
@@ -381,6 +434,7 @@ def load_config(path=None, env=None, require_key=True):
     c.model_dir = str(pick("model_dir", "INDEXTTS2_DIR", "") or "")
     c.python = str(pick("python", "INDEXTTS2_PYTHON", sys.executable))
     c.synth_script = str(pick("synth_script", "SSW_SYNTH_SCRIPT", "") or "")
+    c.engine_keep = str(pick("engine_keep", "SSW_ENGINE_KEEP", "1")).strip().lower() not in ("0", "false", "no", "off")
     try:
         c.need_free_mib = int(pick("need_free_mib", "SSW_NEED_FREE_MIB", 5200))
         if c.need_free_mib < 0:
@@ -543,14 +597,23 @@ def _read_capped(r, limit):
     return body
 
 
-def http_request(method, url, headers=None, data=None, timeout=30, max_bytes=MAX_JSON_BYTES):
-    """-> (status, body bytes). Raises NetError on connection problems, a refused URL or a body over max_bytes. Never follows redirects."""
+def http_request(method, url, headers=None, data=None, timeout=30, max_bytes=MAX_JSON_BYTES, resp_headers=None):
+    """-> (status, body bytes). Raises NetError on connection problems, a refused URL or a body over max_bytes. Never follows redirects.
+    resp_headers, when a dict is given, receives the answer's Retry-After header (the only one callers need)."""
     check_url(url)
     req = urllib.request.Request(url, data=data, method=method, headers=dict(headers or {}))
+
+    def keep(h):
+        if resp_headers is not None and h is not None:
+            v = h.get("Retry-After")
+            if v:
+                resp_headers["retry-after"] = str(v)
     try:
         with _opener(url).open(req, timeout=timeout) as r:
+            keep(r.headers)
             return r.status, _read_capped(r, max_bytes)
     except urllib.error.HTTPError as e:
+        keep(e.headers)
         try:
             body = _read_capped(e, max_bytes)
         except Exception:
@@ -649,27 +712,67 @@ class Api:
         except ValueError:
             return {}
 
-    def _finish(self, status, body):
+    def _finish(self, status, body, headers=None):
         if status == 401:
             raise ExitRun(EXIT_KEY, "key refused")
         if status == 426:
             raise ExitRun(EXIT_PROTOCOL, "protocol refused")
-        if status >= 500 or status in (408, 429):
+        if status == 429:
+            raise NetError(f"HTTP {status}", retry_after=retry_after_seconds(headers, self._parse(body)))
+        if status >= 500 or status == 408:
             raise NetError(f"HTTP {status}")
         return status, self._parse(body)
 
     def get_me(self):
+        h = {}
         s, b = http_request("GET", self.base + "/api/worker/me",
-                            self._headers({"X-Worker-Protocol": str(PROTOCOL)}), timeout=self.timeout)
-        return self._finish(s, b)
+                            self._headers({"X-Worker-Protocol": str(PROTOCOL)}), timeout=self.timeout, resp_headers=h)
+        return self._finish(s, b, h)
 
     def post(self, route, body):
         body = dict(body)
         body["protocol"] = PROTOCOL
         data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        h = {}
         s, b = http_request("POST", f"{self.base}/api/worker/{route}",
-                            self._headers({"Content-Type": "application/json"}), data=data, timeout=self.timeout)
-        return self._finish(s, b)
+                            self._headers({"Content-Type": "application/json"}), data=data, timeout=self.timeout,
+                            resp_headers=h)
+        return self._finish(s, b, h)
+
+
+def retry_after_seconds(headers, data, now=None):
+    """Seconds a 429 asks us to wait: the Retry-After header (seconds or an HTTP date), else the body's
+    retry_after_seconds. None when neither is usable. Capped at RETRY_AFTER_CAP so a bad answer cannot park a worker."""
+    v = None
+    raw = (headers or {}).get("retry-after")
+    if raw:
+        try:
+            v = float(raw)
+        except ValueError:
+            try:
+                when = email.utils.parsedate_to_datetime(raw)
+                v = when.timestamp() - (time.time() if now is None else now)
+            except (TypeError, ValueError, IndexError):
+                v = None
+    if v is None and isinstance(data, dict):
+        try:
+            v = float(data.get("retry_after_seconds"))
+        except (TypeError, ValueError):
+            v = None
+    if v is None or v != v:
+        return None
+    return max(0.0, min(v, float(RETRY_AFTER_CAP)))
+
+
+def idle_wait(base, rnd=None):
+    """Seconds to wait on an empty queue: base with +-IDLE_JITTER, at least 1 s and never over IDLE_CAP_SECONDS."""
+    rnd = random.random if rnd is None else rnd
+    try:
+        base = float(base)
+    except (TypeError, ValueError):
+        base = IDLE_BASE_SECONDS
+    w = max(1.0, base) * (1.0 + IDLE_JITTER * (2.0 * rnd() - 1.0))
+    return round(max(1.0, min(w, float(IDLE_CAP_SECONDS))), 1)
 
 
 class Backoff:
@@ -795,12 +898,29 @@ class JobCtx:
         self.started_at = utc_iso()
         self.n = len(payload.get("lines", [])) if isinstance(payload, dict) and isinstance(payload.get("lines"), list) else 0
         self.worker = None
+        self.grace_until = None      # set once every line is made: from then on only a lost lease may abort
+        self.load_s = 0.0            # engine start to ready, summed over this job's runs (0 when a loaded one was reused)
+        self.synth_s = 0.0           # time spent in run_synth, summed over this job's runs
+
+    def start_grace(self, seconds=None):
+        """Every line is made: a stop or a yield now waits for the upload and complete (bounded), because throwing the
+        finished work away costs a whole job's GPU time while finishing costs seconds."""
+        self.grace_until = time.monotonic() + (FINISH_GRACE_SECONDS if seconds is None else seconds)
+
+    def in_grace(self):
+        return self.grace_until is not None and time.monotonic() < self.grace_until
 
     def check(self):
         if self.fatal is not None:
             raise self.fatal
         if self.lost.is_set():
             raise LeaseLost(self.lost_status)
+        if self.in_grace():
+            # the job finishes, but a local program that wants the GPU still gets the idle engine's memory now
+            w = self.worker
+            if w is not None and w.engine_alive() and w.yield_busy():
+                w.engine_shutdown("yield")
+            return
         if self.worker is not None and self.worker.stop_requested():
             raise Stop()
         if self.worker is not None and self.worker.yield_busy():
@@ -858,6 +978,155 @@ class Heartbeat(threading.Thread):
             self.join(timeout=35)
 
 
+# ----------------------------------------------------------------------------------------------- engine kept loaded
+class EngineHost:
+    """One long-lived `indextts2_worker.py --serve` process, so the model (several GB) is loaded once for many jobs
+    instead of once per job and once per re-run of held lines.
+
+    The engine's stdout and stderr come back on one pipe. A reader thread copies every line into the log file of the
+    job being made (the job's worker.log, which last_error_line() and log_has() read by offset, exactly as when the
+    engine was a per-job process) and picks out two marker lines: READY once the model is loaded and
+    "[JOB-DONE] rc=<n>" after each job. Any way of stopping a job kills the whole process tree and marks the host
+    dead; the next job starts a fresh one."""
+
+    def __init__(self, cmd, env_fn, cwd, max_jobs=ENGINE_MAX_JOBS):
+        self.cmd, self.env_fn, self.cwd, self.max_jobs = list(cmd), env_fn, str(cwd), max_jobs
+        self.proc = None
+        self.jobs = 0
+        self.last_used = time.monotonic()
+        self.spawned_at = None
+        self._sink_lock = threading.Lock()
+        self._sink = None
+        self._ready = self._done = self._eof = None
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def _spawn(self):
+        proc = subprocess.Popen(self.cmd, cwd=self.cwd, env=self.env_fn(), stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **popen_tree_kwargs())
+        ready, done, eof = threading.Event(), queue.Queue(), threading.Event()
+        self.proc, self._ready, self._done, self._eof = proc, ready, done, eof
+        self.jobs, self.spawned_at, self.last_used = 0, time.monotonic(), time.monotonic()
+        threading.Thread(target=self._read, args=(proc, ready, done, eof), daemon=True, name="engine-reader").start()
+
+    def _read(self, proc, ready, done, eof):
+        # proc, ready, done and eof are this spawn's own: a reader left over from a killed process can never signal
+        # (or write into the log of) the process that replaced it.
+        try:
+            for raw in iter(proc.stdout.readline, b""):
+                text = raw.decode("utf-8", "replace").strip()
+                if text == ENGINE_READY_MARKER:
+                    ready.set()
+                    continue
+                m = ENGINE_DONE_RE.match(text)
+                if m:
+                    done.put(int(m.group(1)))
+                    continue
+                with self._sink_lock:
+                    if self._sink is not None and self.proc is proc:
+                        try:
+                            self._sink.write(raw)
+                            self._sink.flush()
+                        except (OSError, ValueError):
+                            pass
+        except (OSError, ValueError):
+            pass
+        finally:
+            eof.set()
+
+    def _ended(self, load_s):
+        """The engine went away without a marker: wait briefly so its last words reach the log, then reap it."""
+        self._eof.wait(5)
+        rc = self.proc.poll() if self.proc is not None else None
+        self.kill()
+        return (rc if rc else 1), load_s
+
+    def run_job(self, ctx, request, log_path, poll=0.25):
+        """Send one batch request and wait for its marker, calling ctx.check() every poll seconds. -> (rc, load_s):
+        load_s is the time from starting the engine to READY when this call started it, else 0. ctx.proc points at
+        the engine while it runs, so every existing kill path reaches it."""
+        load_s = 0.0
+        with open(log_path, "ab") as lf:
+            with self._sink_lock:
+                self._sink = lf
+            try:
+                if not self.alive():
+                    self.kill()
+                    self._spawn()
+                ctx.proc = self.proc
+                if not self._ready.is_set():
+                    while not self._ready.wait(poll):
+                        if self._eof.is_set() or self.proc.poll() is not None:
+                            return self._ended(time.monotonic() - self.spawned_at)
+                        ctx.check()
+                    load_s = time.monotonic() - self.spawned_at
+                try:
+                    self.proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+                    self.proc.stdin.flush()
+                except (OSError, ValueError):
+                    return self._ended(load_s)
+                while True:
+                    try:
+                        rc = self._done.get(timeout=poll)
+                        break
+                    except queue.Empty:
+                        pass
+                    if self._eof.is_set():
+                        try:
+                            rc = self._done.get_nowait()       # the marker came just before the engine exited
+                            break
+                        except queue.Empty:
+                            return self._ended(load_s)
+                    ctx.check()
+                self.jobs += 1
+                self.last_used = time.monotonic()
+                return rc, load_s
+            except BaseException:
+                self.kill()
+                raise
+            finally:
+                with self._sink_lock:
+                    self._sink = None
+                ctx.proc = None
+
+    def needs_recycle(self, now=None):
+        now = time.monotonic() if now is None else now
+        return self.alive() and (self.jobs >= self.max_jobs or now - self.last_used >= ENGINE_IDLE_SECONDS)
+
+    def kill(self):
+        """Kill the engine and everything it started (ffmpeg included) and mark the host dead."""
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        if proc.poll() is None:
+            kill_tree(proc)
+        else:
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        for s in (proc.stdin, proc.stdout):
+            try:
+                if s is not None:
+                    s.close()
+            except Exception:
+                pass
+
+    def stop(self, timeout=10):
+        """Polite stop between jobs: end of stdin makes the engine exit by itself; killed if it does not."""
+        proc = self.proc
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            proc.wait(timeout=timeout)
+        except Exception:
+            pass
+        self.kill()
+
+
 # ----------------------------------------------------------------------------------------------- the worker
 class Worker:
     def __init__(self, cfg, log=None, gpu_query=query_gpu, skip_vram_wait=None, max_cycles=None,
@@ -886,6 +1155,39 @@ class Worker:
         self._signals = 0
         self._yield_at = 0.0
         self._yield_last = False
+        self.engine = None           # EngineHost, created on the first job when engine_keep is on
+        self.tier = None             # the key's tier from /api/worker/me
+
+    # ---- engine kept loaded between jobs
+    def engine_keep(self):
+        return bool(getattr(self.cfg, "engine_keep", True))
+
+    def engine_alive(self):
+        eng = getattr(self, "engine", None)
+        return eng is not None and eng.alive()
+
+    def engine_shutdown(self, why, graceful=False):
+        """Give the GPU memory back: on a yield, after ENGINE_MAX_JOBS runs, after ENGINE_IDLE_SECONDS with no job,
+        and on exit."""
+        eng = getattr(self, "engine", None)
+        if eng is None or eng.proc is None:
+            return
+        was_alive = eng.alive()
+        if graceful:
+            eng.stop()
+        else:
+            eng.kill()
+        if was_alive:
+            self.log.event("engine", None, state="stopped", reason=why)
+
+    def serve_command(self):
+        script = self.cfg.synth_script or str(Path(__file__).resolve().with_name("indextts2_worker.py"))
+        return [self.cfg.python, script, "--serve", "--ref-cache", os.path.abspath(str(self.work / "ref_wav_cache"))]
+
+    def engine_host(self):
+        if getattr(self, "engine", None) is None:
+            self.engine = EngineHost(self.serve_command(), self.synth_env, os.path.abspath(str(self.work)))
+        return self.engine
 
     # ---- stop / sleep
     def request_stop(self, why="stop"):
@@ -897,6 +1199,9 @@ class Worker:
             ctx = getattr(self, "_current", None)
             if ctx is not None:
                 kill_tree(ctx.proc)
+            eng = getattr(self, "engine", None)
+            if eng is not None and eng.proc is not None:
+                kill_tree(eng.proc)         # a loaded engine between jobs is not ctx.proc
             os._exit(1)
         self.request_stop("signal")
 
@@ -927,24 +1232,34 @@ class Worker:
             pass
         return False
 
+    def _stop_now(self, ctx=None):
+        """A stop is wanted and may act now: not while a finished job is still uploading (ctx in its grace time)."""
+        return self.stop_requested() and not (ctx is not None and ctx.in_grace())
+
     def _real_sleep(self, seconds, ctx=None):
         end = time.time() + seconds
         while time.time() < end:
-            if self.stop_requested() or (ctx is not None and (ctx.lost.is_set() or ctx.fatal is not None)):
+            if self._stop_now(ctx) or (ctx is not None and (ctx.lost.is_set() or ctx.fatal is not None)):
                 return
             time.sleep(min(0.5, max(0.0, end - time.time())))
 
     def sleep(self, seconds, ctx=None):
         self.sleep_impl(seconds, ctx)
-        if self.stop_requested():
+        if self._stop_now(ctx):
             raise Stop()
         if ctx is not None:
             ctx.check()
 
+    def net_delay(self, e):
+        """Backoff for a network error; at least what a 429 asked for (capped in retry_after_seconds)."""
+        d = self.backoff.next()
+        ra = getattr(e, "retry_after", None)
+        return max(d, ra) if ra else d
+
     # ---- retry wrapper
     def call_retry(self, fn, ctx=None):
         while True:
-            if self.stop_requested():
+            if self._stop_now(ctx):
                 raise Stop()
             if ctx is not None:
                 ctx.check()
@@ -953,7 +1268,7 @@ class Worker:
                 self.backoff.ok()
                 return r
             except NetError as e:
-                d = self.backoff.next()
+                d = self.net_delay(e)
                 self.log.event("backoff", ctx.job_id if ctx else None, seconds=d, error=str(e))
                 self.sleep(d, ctx)
 
@@ -985,9 +1300,11 @@ class Worker:
 
     def claim_body(self, resume):
         g = self.gpu_query() or {}
+        # a public-tier key belongs to an anonymous volunteer: their computer's name is not sent
+        name = "worker" if getattr(self, "tier", None) == "public" else self.cfg.machine_name
         body = {"worker_version": WORKER_VERSION, "engines": [ENGINE], "recipes": [RECIPE],
                 "model_hash": self.model_hash, "model_revision": self.revision[:80],
-                "machine_name": self.cfg.machine_name, "os": os_string(), "resume": resume}
+                "machine_name": name, "os": os_string(), "resume": resume}
         for k_body, k_g in (("gpu", "name"), ("vram_total_mib", "vram_total_mib"), ("vram_free_mib", "vram_free_mib"),
                             ("gpu_util", "gpu_util")):
             if g.get(k_g) is not None:
@@ -1025,6 +1342,10 @@ class Worker:
                     ids.append(d.name)
                 else:
                     rmtree_retry(d)
+        # Only the newest MAX_RESUME are offered back to the site; older ones can never be resumed, so they go now
+        # (they used to stay on disk for ever).
+        for jid in ids[MAX_RESUME:]:
+            self.delete_job_dir(jid)
         return ids[:MAX_RESUME]
 
     # ---- startup (8.3 step 1)
@@ -1045,21 +1366,25 @@ class Worker:
                 status, data = self.api.get_me()
                 break
             except NetError as e:
-                d = self.backoff.next()
+                d = self.net_delay(e)
                 self.log.event("backoff", None, seconds=d, error=str(e), where="me")
                 self.sleep(d)
         self.backoff.ok()
         w = data.get("worker") if isinstance(data, dict) else None
         if isinstance(w, dict):
+            self.tier = w.get("tier") if isinstance(w.get("tier"), str) else None
             self.log.event("start", None, label=str(w.get("label", ""))[:40], tier=w.get("tier"), status=w.get("status"))
 
     def wait_for_vram(self):
         while self.yield_busy(force=True):
+            self.engine_shutdown("yield")          # local GPU work gets the engine's memory back
             self.log.event("idle", None, reason="yield", wait=YIELD_POLL_SECONDS)
             self.sleep(YIELD_POLL_SECONDS)
         need = self.cfg.need_free_mib
         if need <= 0 or self.skip_vram_wait:
             return
+        if self.engine_alive():
+            return      # our own loaded engine is what uses the memory: waiting for it to be free would never end
         while True:
             free = (self.gpu_query() or {}).get("vram_free_mib")
             if free is None or free >= need:       # no nvidia-smi: cannot know, go on
@@ -1111,6 +1436,8 @@ class Worker:
         except ExitRun as e:
             self.log.event("stop", None, reason=str(e) or "exit", code=e.code)
             return e.code
+        finally:
+            self.engine_shutdown("exit", graceful=True)
 
     def cycle(self):
         self.wait_for_vram()
@@ -1126,13 +1453,24 @@ class Worker:
                 self.delete_job_dir(jid)
         if not isinstance(job, dict):
             reason = data.get("reason") or ("paused" if status == 403 else "none")
-            try:
-                wait = float(data.get("retry_after_seconds") or IDLE_BASE_SECONDS) if status == 200 else IDLE_CAP_SECONDS
-            except (TypeError, ValueError):
-                wait = IDLE_BASE_SECONDS
-            wait = self.idle_delay if self.idle_delay > wait else wait
+            hint = None
+            if status == 200:
+                try:
+                    hint = float(data.get("retry_after_seconds"))
+                    hint = hint if hint == hint and hint > 0 else None
+                except (TypeError, ValueError):
+                    hint = None
+            if status != 200:
+                base = IDLE_CAP_SECONDS
+            elif hint is not None:
+                base = hint                     # the site knows when work is due: use its figure
+            else:
+                base = self.idle_delay
+                self.idle_delay = min(self.idle_delay * 2, IDLE_CAP_SECONDS)
+            wait = idle_wait(base)
+            if getattr(self, "engine", None) is not None and self.engine.needs_recycle():
+                self.engine_shutdown("idle" if self.engine.jobs < self.engine.max_jobs else "max_jobs")
             self.log.event("idle", None, reason=reason, wait=wait)
-            self.idle_delay = min(wait * 2, IDLE_CAP_SECONDS)
             self.sleep(wait)
             return
         self.idle_delay = IDLE_BASE_SECONDS
@@ -1182,10 +1520,12 @@ class Worker:
             raise
         except Yield:
             kill_tree(ctx.proc)
+            self.engine_shutdown("yield")           # the local program wants the memory, not just the job
             self.release(ctx, "yielded to local GPU work")
             self.log.event("idle", job_id, reason="yield")
         except ExitRun:
             kill_tree(ctx.proc)
+            self.engine_shutdown("exit")
             raise
         except JobFail as f:
             try:
@@ -1205,7 +1545,7 @@ class Worker:
     def release(self, ctx, message="worker stopped"):
         """Ctrl+C / STOP: give the job back (attempt refunded). One try only: the user wants out."""
         try:
-            self.post_job("fail", {"reason": "released", "message": message, "retryable": True}, ctx,
+            self.post_job("fail", {"reason": "released", "message": safe_msg(message)[:500], "retryable": True}, ctx,
                           retry=False)
             self.log.event("fail", ctx.job_id, reason="released")
         except (LeaseLost, NetError, ExitRun) as e:
@@ -1214,7 +1554,8 @@ class Worker:
     def send_fail(self, ctx, f):
         self.log.event("fail", ctx.job_id, reason=f.reason, retryable=f.retryable, message=f.message[:200])
         try:
-            status, data = self.post_job("fail", {"reason": f.reason, "message": f.message[:500],
+            # cleaned here, in the one place a failure leaves the machine, so no call site can forget it
+            status, data = self.post_job("fail", {"reason": f.reason, "message": safe_msg(f.message)[:500],
                                                   "retryable": f.retryable}, ctx)
             if status == 400:
                 self.log.event("error", ctx.job_id, where="fail", error=f"HTTP 400 {data.get('code', '')}")
@@ -1243,7 +1584,9 @@ class Worker:
             self.log.event("run_start", ctx.job_id, run=runs, lines=ctx.n)
             log_path = ctx.dir / "worker.log"
             offset = log_path.stat().st_size if log_path.exists() else 0
+            t_synth = time.time()
             rc = self.run_synth(ctx)
+            ctx.synth_s += time.time() - t_synth
             st = self.scan(ctx)
             unsafe = self.log_has(log_path, offset, GPU_UNSAFE_MARKER)
             err = last_error_line(log_path, offset) if rc else ""
@@ -1269,6 +1612,7 @@ class Worker:
                 msg += f"; last error: {last_err}"
             raise JobFail("line_failed", msg[:200], True, False)
 
+        ctx.start_grace()      # every line is made: only a lost lease (or the grace running out) stops the delivery
         for upload_round in range(3):
             self.upload_all(ctx, st)
             ctx.check()
@@ -1290,8 +1634,13 @@ class Worker:
         self.session_clips += ok_n + held_n
         self.session_audio += job_audio
         self.session_words += job_words
+        # load_s / gen_s (added in 1.1.0, after the older fields so existing readers are unaffected): model load time
+        # (0 when the kept engine was reused; not known in one-process-per-job mode, where it is inside gen_s)
+        load_s = round(ctx.load_s, 1) if self.engine_keep() else None
+        gen_s = round(max(0.0, ctx.synth_s - (ctx.load_s if self.engine_keep() else 0.0)), 1)
         self.log.event("complete", ctx.job_id, ok=ok_n, held=held_n, seconds=round(time.time() - t_run, 1),
-                       already=data.get("already"), words=job_words, audio=round(job_audio))
+                       already=data.get("already"), words=job_words, audio=round(job_audio), load_s=load_s,
+                       gen_s=gen_s)
         self.delete_job_dir(ctx.job_id)
 
     # ---- refs (8.3 step 5)
@@ -1358,6 +1707,30 @@ class Worker:
         return env
 
     def run_synth(self, ctx):
+        """Make the job's lines. -> the engine's exit code for this run (0 = all made or held)."""
+        if self.engine_keep():
+            return self.run_synth_kept(ctx)
+        return self.run_synth_once(ctx)
+
+    def engine_request(self, ctx):
+        """One serve-mode request. Absolute paths: the engine runs in the work folder, not in the job's folder."""
+        return {"batch_file": os.path.abspath(str(ctx.dir / "chunk.json")), "output_dir": os.path.abspath(str(ctx.out)),
+                "references": os.path.abspath(str(self.refs_dir)), "bitrate": ctx.payload["settings"]["bitrate"]}
+
+    def run_synth_kept(self, ctx):
+        ctx.check()
+        host = self.engine_host()
+        if host.alive() and host.jobs >= host.max_jobs:
+            self.engine_shutdown("max_jobs", graceful=True)   # a fresh process now and then: no slow leak builds up
+        started = not host.alive()
+        rc, load_s = host.run_job(ctx, self.engine_request(ctx), ctx.dir / "worker.log")
+        ctx.load_s += load_s
+        if started:
+            self.log.event("engine", ctx.job_id, state="started", ready=host.alive(), load_s=round(load_s, 1))
+        return rc
+
+    def run_synth_once(self, ctx):
+        """One engine process for this run only (SSW_ENGINE_KEEP=0): the behaviour before 1.1.0."""
         ctx.check()
         with open(ctx.dir / "worker.log", "ab") as lf:
             proc = subprocess.Popen(self.synth_command(ctx), cwd=str(ctx.dir), env=self.synth_env(),
@@ -1424,9 +1797,16 @@ class Worker:
             files.append({"index": i, "bytes": v["bytes"], "sha256": v["sha256"]})
         urls = self.request_upload_urls(ctx, files)
         t0 = time.time()
-        for i, v in st.items():
+        url_lock = threading.Lock()       # a 403 refresh replaces one entry; the other threads read theirs
+        cancel = threading.Event()
+
+        def one(i, v):
+            # the same three tries, 403 refresh and ctx.check() between files as before; now UPLOAD_THREADS at a time
+            if cancel.is_set():
+                return
             ctx.check()
-            entry = urls.get(i)
+            with url_lock:
+                entry = urls.get(i)
             for attempt in range(1, 4):
                 ok = False
                 try:
@@ -1442,13 +1822,32 @@ class Worker:
                 self.log.event("upload", ctx.job_id, index=i, attempt=attempt, error=err)
                 if attempt == 3:
                     raise JobFail("upload_failed", f"upload of line {i} failed: {err}"[:200], True, False)
+                if cancel.is_set():
+                    return
                 self.sleep(2 * attempt, ctx)
                 if refresh:
-                    urls.update(self.request_upload_urls(ctx, [f for f in files if f["index"] == i]))
-                    entry = urls.get(i)
+                    with url_lock:
+                        urls.update(self.request_upload_urls(ctx, [f for f in files if f["index"] == i]))
+                        entry = urls.get(i)
             v["key"] = entry["key"]
+
+        pool = ThreadPoolExecutor(max_workers=UPLOAD_THREADS, thread_name_prefix="upload")
+        futs = [pool.submit(one, i, v) for i, v in st.items()]
+        try:
+            pending = set(futs)
+            while pending:
+                done, pending = futures_wait(pending, timeout=0.25, return_when=FIRST_EXCEPTION)
+                for f in done:
+                    f.result()                         # the first failure (JobFail, Stop, LeaseLost ...) ends the upload
+                if pending:
+                    ctx.check()
+        except BaseException:
+            cancel.set()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
         self.log.event("upload", ctx.job_id, files=len(files), bytes=sum(v["bytes"] for v in st.values()),
-                       seconds=round(time.time() - t0, 1))
+                       seconds=round(time.time() - t0, 1), threads=UPLOAD_THREADS)
 
     def request_upload_urls(self, ctx, files):
         status, data = self.post_job("upload-urls", {"files": files}, ctx)

@@ -172,23 +172,24 @@ TARGET_RMS_DB = -18.0
 # -16.0 LUFS median. Until then this encoder only lifted clips under
 # -26 dB RMS. Now every clip is measured (EBU R128 integrated loudness, after trim and post_af) and:
 #   under TARGET - WINDOW            -> levelled to TARGET (two-pass loudnorm, linear gain, limiter);
-#   over TARGET + WINDOW, no "!"     -> levelled down to TARGET;
-#   over TARGET + WINDOW, with "!"   -> left loud: a shouted line is meant to be loud;
-#   within the window                -> untouched.
+#   over TARGET + WINDOW             -> levelled down to TARGET, "!" lines included;
+#   within the window                -> untouched (so a shouted line may sit up to -14).
+# Until 2026-11-11 a "!" line over the window was left loud. Lines kept that way came out far too hot (around -8 LUFS,
+# true peaks above 0 dBTP, so they clipped) and sounded distorted; on a listening test -14 to -16 was preferred.
 TARGET_LUFS = -16.0
 LOUDNESS_WINDOW_LU = 2.0
 PEAK_CEILING_DB = -3.0  # loudnorm true-peak target; Vorbis at 32 kbps overshoots it by 1-2 dB
 LIMIT_LINEAR = 0.7      # alimiter ceiling (-3.1 dBFS) after loudnorm
-LEVEL_RECIPE = "lufs-16-w2-shout-v1"
+LEVEL_RECIPE = "lufs-16-w2-v2"
 
 
 def loudness_plan(measured_i, shout):
-    """'up', 'down' or None (leave) for a clip at measured_i LUFS."""
+    """'up', 'down' or None (leave) for a clip at measured_i LUFS. `shout` is kept for callers; it no longer exempts."""
     if measured_i is None or measured_i < -70:
         return None
     if measured_i < TARGET_LUFS - LOUDNESS_WINDOW_LU:
         return "up"
-    if measured_i > TARGET_LUFS + LOUDNESS_WINDOW_LU and not shout:
+    if measured_i > TARGET_LUFS + LOUDNESS_WINDOW_LU:
         return "down"
     return None
 
