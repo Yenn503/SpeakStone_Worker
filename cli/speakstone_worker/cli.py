@@ -263,7 +263,7 @@ def start_now(console, install, settings, flow=None):
             runner.stop_and_wait()
             runner = WorkerGroup(install, settings["workers"])
             old = None
-    started, paused = time.time(), False
+    started, paused, paused_until, choosing = time.time(), False, None, False
     ctl = control_mod.Control()
     if flow:
         flow.args = ["--start"]                      # an update while working restarts straight into making lines
@@ -282,6 +282,8 @@ def start_now(console, install, settings, flow=None):
                 state = "paused" if paused else ("stopped" if not runner.running else "idle")
                 view = board_state(install, col.queue, gpu, state, started, workers=runner.count, net=net,
                                    update_version=flow.version if flow else None)
+                view["pause_choice"] = choosing
+                view["paused_until"] = control_mod.until_label(paused_until) if paused and paused_until else None
                 # Redraw only every 5 s or when something changed: a 4/s full-screen redraw flickered (owner 2026-11-11).
                 resized = console.size != last_size
                 if resized or (view != last_view and time.time() - last_draw >= 2) or time.time() - last_draw >= 5:
@@ -290,9 +292,22 @@ def start_now(console, install, settings, flow=None):
                 k = keys.poll(1.0)
                 if flow and not paused:
                     update_step(flow, ctl, settings, runner)       # a swap restarts with --start and does not return
-                if k == "p":
-                    paused = not paused
-                    runner.request_stop() if paused else runner.start()
+                if paused and paused_until and time.time() >= paused_until:      # a timed pause ends by itself
+                    paused, paused_until = False, None
+                    runner.start()
+                if choosing and k:
+                    choosing = False
+                    minutes = board.PAUSE_KEYS.get(k)
+                    if minutes is not None:
+                        paused, paused_until = True, (time.time() + minutes * 60 if minutes else None)
+                        runner.request_stop()
+                    k = None
+                elif k == "p":
+                    if paused:
+                        paused, paused_until = False, None
+                        runner.start()
+                    else:
+                        choosing = True                                       # next key picks how long
                 elif k in ("s", "m"):
                     result = "exit" if k == "s" else "menu"
                     break
@@ -582,6 +597,7 @@ def update_step(flow, control, st, runner, clock=time.time, drain_limit=DRAIN_LI
         return False
     control.drain_reason = None
     control.status = control_mod.UPDATING
+    flow.log(f"update {flow.version}: restarting as the new version")
     note = flow.apply()
     flow.forced = False
     flow.log(note)
@@ -602,7 +618,18 @@ def make_tray_actions(install, control, st, flow, open_board=tray_mod.open_board
         d = Path(install) / "work" / "logs"
         d.mkdir(parents=True, exist_ok=True)
         open_folder(d)
-    return {"pause": lambda: control.set_paused(True), "resume": lambda: control.set_paused(False),
+    def pause_for(minutes):
+        def run():
+            until = time.time() + minutes * 60 if minutes else None
+            control.pause(until)
+            st["paused_until"] = until or 0          # a timed pause is kept, so it survives a restart or an update
+        return run
+
+    def resume():
+        control.set_paused(False)
+        st["paused_until"] = 0
+    acts = {k: pause_for(m) for k, _label, m in tray_mod.PAUSE_CHOICES}
+    return {**acts, "resume": resume,
             "block_fullscreen": toggle("block_fullscreen"), "block_on_battery": toggle("block_on_battery"),
             "auto_update": toggle("auto_update"), "board": lambda: open_board(interactive_command()),
             "check": control.request_check, "update_now": control.request_check, "logs": logs,
@@ -610,9 +637,49 @@ def make_tray_actions(install, control, st, flow, open_board=tray_mod.open_board
 
 
 def tray_state_reader(control, st):
-    return lambda: {"status": control.status, "paused": control.paused,
+    return lambda: {"status": control.status, "paused": control.paused, "paused_until": control.paused_until,
                     "settings": {k: _setting(st, k) for k, _ in tray_mod.TOGGLES},
                     "update_version": control.update_version}
+
+
+def restore_pause(control, st, now=None):
+    """At start: a timed pause still running is picked up again; an expired one is cleared."""
+    now = now or time.time()
+    until = _setting(st, "paused_until", 0) or 0
+    if until > now:
+        control.pause(until)
+    elif until:
+        st["paused_until"] = 0
+
+
+def pause_expiry_step(control, st, now=None):
+    """A timed pause ends by itself; the next tick then lets the worker start again."""
+    if control.pause_expired(now or time.time()):
+        control.set_paused(False)
+        st["paused_until"] = 0
+        return True
+    return False
+
+
+class ExitNote:
+    """Why the background mode ended, written once to background.log. Set the first reason that applies; `write` is
+    safe to call from a signal handler or the console-close handler and never raises."""
+
+    def __init__(self, install, version=__version__):
+        self.install, self.version, self.reason, self.done, self.updating = install, version, None, False, False
+
+    def set(self, reason):
+        if self.reason is None:
+            self.reason = reason
+
+    def write(self):
+        if self.done:
+            return
+        self.done = True
+        try:
+            log_background_error(self.install, f"background {self.version} ended: {self.reason or 'unknown'}")
+        except Exception:
+            pass
 
 
 def job_running_now(install, workers=1, now=None):
@@ -625,6 +692,24 @@ def job_running_now(install, workers=1, now=None):
 
 
 def background(install, st, flow=None, tray_start=tray_mod.start, making=job_running_now):
+    """The service. Whatever ends it, one line in background.log says why (a hard kill cannot be logged)."""
+    note = ExitNote(install)
+    log_background_error(install, f"background {__version__} started")
+    try:
+        code = _background(install, st, note, flow, tray_start, making)
+        note.set("setup not finished" if code == 2 else "stopped")
+        return code
+    except SystemExit as e:
+        note.set("update (restarting as the new version)" if note.updating else f"exit {e.code} (task ended / signal)")
+        raise
+    except BaseException as e:
+        note.set(f"error: {type(e).__name__}: {e}")
+        raise
+    finally:
+        note.write()
+
+
+def _background(install, st, note, flow, tray_start, making):
     hide_console()
     set_title(window_title("background"))
     if setup.is_set_up(install) and not setup.extras_cached(install):
@@ -641,8 +726,14 @@ def background(install, st, flow=None, tray_start=tray_mod.start, making=job_run
     flow.args = ["--background"]               # after an update the new process carries on as the service
     update.cleanup_old(flow.exe)
     control = control_mod.Control()
+    restore_pause(control, st)
     runner = WorkerGroup(install, st["workers"])
-    install_close_handlers(runner.shutdown_fast)
+
+    def on_close():                              # console closed, log-off, shutdown, SIGTERM/SIGBREAK/SIGHUP
+        note.set("task ended / signal")
+        note.write()                             # now: the process may be ended within seconds
+        runner.shutdown_fast()
+    install_close_handlers(on_close)
     gate = RestartGate()
     tray = tray_start(__version__, tray_state_reader(control, st), make_tray_actions(install, control, st, flow),
                       paths.assets_dir() / "icon.png", log)
@@ -653,18 +744,25 @@ def background(install, st, flow=None, tray_start=tray_mod.start, making=job_run
                 reload = getattr(st, "reload", None)
                 if reload:
                     reload()
+                pause_expiry_step(control, st)
                 background_tick(runner, st, gate=gate, control=control)    # first: claim at once when the rules allow
-                update_step(flow, control, st, runner)
+                try:
+                    update_step(flow, control, st, runner)
+                except SystemExit:                  # a swap on Windows ends the process this way
+                    note.updating = True
+                    raise
                 if runner.running and time.time() - last_making > 10:
                     making_now, last_making = making(install, st["workers"]), time.time()
                 control.status = control_mod.status_for(runner.running, making_now and runner.running, control.paused,
-                                                        drain=control.drain_reason)
+                                                        drain=control.drain_reason, until=control.paused_until)
             except Exception as e:                  # one odd tick must not end the service
                 log(f"tick failed: {type(e).__name__}: {e}")
             time.sleep(5)
     except KeyboardInterrupt:
-        pass
+        note.set("interrupted (Ctrl+C)")
     finally:
+        if control.quit:
+            note.set("quit from the tray")
         if tray:
             tray.stop()
         if runner.running:

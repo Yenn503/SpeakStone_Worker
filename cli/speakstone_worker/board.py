@@ -142,7 +142,8 @@ def render_board(s):
     if state == "paused":
         now.append("> ", style=GOLD)
         now.append("Paused", style=BIG)
-        now.append(" - the current job was given back. Press [P] to carry on.", style=DIM)
+        until = f" until {s['paused_until']}" if s.get("paused_until") else ""
+        now.append(f"{until} - the current job was given back. Press [P] to carry on.", style=DIM)
     elif s.get("making") and s.get("job"):
         now.append("> ", style=GOLD)
         now.append(f"Job {s['job'][:8]}", style=BIG)
@@ -172,6 +173,10 @@ def render_board(s):
             ev.append("\n")
 
     foot = Text()
+    if s.get("pause_choice"):
+        foot.append(" Pause for: ", style=GOLD)
+        foot.append("[1] 15 minutes  [2] 1 hour  [3] 2 hours  [4] 4 hours  [5] until I resume  (any other key cancels)", style=PARCH)
+        foot.append("\n")
     foot.append(" [P] ", style=GOLD)
     foot.append("resume" if state == "paused" else "pause", style=DIM)
     foot.append("   [S] ", style=GOLD)
@@ -191,6 +196,8 @@ def render_board(s):
     return root
 
 
+# the key pressed after [P] on the board -> minutes to pause (0 = until resumed)
+PAUSE_KEYS = {"1": 15, "2": 60, "3": 120, "4": 240, "5": 0}
 STEP_ICON = {"done": ("✓", GREEN), "run": ("●", GOLD), "todo": (" ", DIM)}
 
 

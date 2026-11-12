@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import sys
+import time
 import urllib.error
 from pathlib import Path
 
@@ -24,7 +25,7 @@ def release_json(tag="v1.3.0", names=("SpeakStoneWorker-windows.exe", "SpeakSton
 
 # ------------------------------------------------------------------ version and asset choice
 def test_version_is_shown_and_bumped():
-    assert __version__ == "1.2.0"
+    assert __version__ == "1.2.1"
     assert f"{APP_NAME} {__version__}" in board.menu_screen().plain
     assert cli.window_title() == f"{APP_NAME} {__version__}"
     assert "Update now" in board.menu_screen(False, "1.3.0").plain
@@ -489,7 +490,7 @@ def test_background_sets_the_service_arguments(tmp_path, monkeypatch):
 def test_the_first_tick_after_a_restart_claims_before_any_update_work():
     """background(): the tick runs before update_step, so a restarted service starts its worker at once."""
     import inspect
-    src = inspect.getsource(cli.background)
+    src = inspect.getsource(cli._background)
     assert src.index("background_tick(") < src.index("update_step(")
 
 
@@ -599,7 +600,7 @@ class FakePystray:
     class Menu:
         SEPARATOR = object()
 
-        def __init__(self, items):
+        def __init__(self, *items):
             self.items = items
 
     class MenuItem:
@@ -628,7 +629,7 @@ def fake_tray(actions, state=None, log=None):
 
 def test_each_menu_item_calls_its_action():
     calls = []
-    keys = ["pause", "resume", "block_fullscreen", "block_on_battery", "auto_update", "board", "check", "update_now",
+    keys = ["pause_15", "pause_60", "pause_120", "pause_240", "pause_0", "resume", "block_fullscreen", "block_on_battery", "auto_update", "board", "check", "update_now",
             "logs", "quit"]
     t, _ = fake_tray({k: (lambda k=k: calls.append(k)) for k in keys})
     for k in keys:
@@ -770,8 +771,8 @@ def test_tray_actions_change_control_and_settings(tmp_path):
     opened, folders = [], []
     acts = cli.make_tray_actions(tmp_path, c, st, None, open_board=lambda cmd: opened.append(cmd),
                                  open_folder=lambda p: folders.append(p))
-    acts["pause"]()
-    assert c.paused
+    acts["pause_0"]()
+    assert c.paused and c.paused_until is None and st["paused_until"] == 0
     acts["resume"]()
     assert not c.paused
     acts["block_fullscreen"]()
@@ -787,6 +788,206 @@ def test_tray_actions_change_control_and_settings(tmp_path):
     assert c.take_check() and not c.take_check()
     acts["quit"]()
     assert c.quit
+
+
+def test_pause_submenu_in_the_menu_model():
+    items = tray.build_menu("1.2.1", "Waiting for work", False, SETTINGS)
+    pause = by_key(items)["pause"]
+    assert [c.label for c in pause.children] == ["15 minutes", "1 hour", "2 hours", "4 hours", "Until I resume"]
+    assert [c.key for c in pause.children] == ["pause_15", "pause_60", "pause_120", "pause_240", "pause_0"]
+    assert "resume" not in by_key(items)
+
+
+def test_while_paused_the_top_level_shows_resume_and_no_submenu():
+    m = by_key(tray.build_menu("1.2.1", "Paused until 21:30", True, SETTINGS))
+    assert m["resume"].label == "Resume" and "pause" not in m and m["status"].label == "Paused until 21:30"
+
+
+def test_pause_submenu_becomes_a_pystray_submenu():
+    t, _ = fake_tray({k: (lambda: None) for k, _l, _m in tray.PAUSE_CHOICES})
+    sub = [i for i in t._menu_items() if getattr(i, "text", "") == "Pause"][0]
+    assert isinstance(sub.action, FakePystray.Menu)
+    assert [i.text for i in sub.action.items] == ["15 minutes", "1 hour", "2 hours", "4 hours", "Until I resume"]
+
+
+def test_timed_pause_sets_an_end_time_and_is_saved(tmp_path):
+    c, st = control_mod.Control(), Settings(tmp_path / "cli.json")
+    acts = cli.make_tray_actions(tmp_path, c, st, None)
+    before = time.time()
+    acts["pause_60"]()
+    assert c.paused and before + 3590 < c.paused_until < before + 3700
+    assert json.loads((tmp_path / "cli.json").read_text())["paused_until"] == c.paused_until
+    acts["resume"]()
+    assert not c.paused and c.paused_until is None and st["paused_until"] == 0
+
+
+def test_timed_pause_ends_by_itself_and_the_worker_may_start_again():
+    c, r = control_mod.Control(), FakeRunner(running=False)
+    st = dict(ST, paused_until=0)
+    c.pause(until=1000.0)
+    assert not cli.pause_expiry_step(c, st, now=999.0) and c.paused
+    assert cli.pause_expiry_step(c, st, now=1000.0) and not c.paused and st["paused_until"] == 0
+    assert cli.background_tick(r, ST, readers=RD, control=c) == "start"
+
+
+def test_timed_pause_still_drains_the_job_in_hand():
+    c, r = control_mod.Control(), FakeRunner(running=True)
+    c.pause(until=time.time() + 900)
+    assert cli.background_tick(r, ST, readers=RD, control=c) == "drain" and r.drains == 1 and r.stops == 0
+
+
+def test_timed_pause_survives_a_restart_and_an_expired_one_is_cleared(tmp_path):
+    st = Settings(tmp_path / "cli.json")
+    st["paused_until"] = time.time() + 600
+    c = control_mod.Control()
+    cli.restore_pause(c, Settings(tmp_path / "cli.json"))               # the new process after a restart or an update
+    assert c.paused and c.paused_until == st["paused_until"]
+    st["paused_until"] = time.time() - 5
+    c2 = control_mod.Control()
+    s2 = Settings(tmp_path / "cli.json")
+    cli.restore_pause(c2, s2)
+    assert not c2.paused and s2["paused_until"] == 0
+
+
+def test_until_i_resume_is_not_kept_across_a_restart(tmp_path):
+    c, st = control_mod.Control(), Settings(tmp_path / "cli.json")
+    cli.make_tray_actions(tmp_path, c, st, None)["pause_0"]()
+    c2 = control_mod.Control()
+    cli.restore_pause(c2, Settings(tmp_path / "cli.json"))
+    assert not c2.paused
+
+
+def test_status_says_until_when_for_a_timed_pause():
+    until = time.mktime((2026, 11, 12, 21, 30, 0, 0, 0, -1))
+    assert control_mod.status_for(False, False, True, until=until) == "Paused until 21:30"
+    assert control_mod.status_for(False, False, True) == "Paused"
+    assert control_mod.status_for(True, True, True, until=until) == "Pausing after this job"
+
+
+def test_board_pause_keys_and_prompt():
+    assert board.PAUSE_KEYS == {"1": 15, "2": 60, "3": 120, "4": 240, "5": 0}
+    from rich.console import Console
+    from speakstone_worker import stats
+    s = {"lines": 0, "words": 0, "audio_min": 0, "lines_hour": 0, "words_hour": 0, "events": [],
+         "spark": [0.0] * stats.BUCKETS, "queue": None, "gpu": None, "state": "paused", "making": False,
+         "workers": 1, "pause_choice": True, "paused_until": "21:30"}
+    con = Console(width=140, height=40, record=True, file=open(os.devnull, "w", encoding="utf-8"))
+    con.print(board.render_board(s))
+    text = con.export_text()
+    assert "[5] until I resume" in text and "until 21:30" in text
+
+
+# ------------------------------------------------------------------ why the background mode ended
+def bg_env(tmp_path, monkeypatch, tick):
+    from speakstone_worker import setup
+    for n, v in (("hide_console", lambda: None), ("set_title", lambda t: None)):
+        monkeypatch.setattr(cli, n, v)
+    monkeypatch.setattr(setup, "is_set_up", lambda i: True)
+    monkeypatch.setattr(setup, "extras_cached", lambda i: True)
+    monkeypatch.setattr(setup, "sync_worker_files", lambda *a: None)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    handlers = []
+    monkeypatch.setattr(cli, "install_close_handlers", handlers.append)
+    monkeypatch.setattr(cli, "WorkerGroup", lambda install, n: FakeRunner())
+    monkeypatch.setattr(cli, "background_tick", tick)
+    return handlers
+
+
+def bg_log(tmp_path):
+    return (tmp_path / "work" / "logs" / "background.log").read_text()
+
+
+def run_bg(tmp_path, tick_fn, st=None):
+    f = make_flow(tmp_path, check_result=None)
+    return cli.background(tmp_path, st or {"workers": 1, "paused_until": 0}, flow=f, tray_start=lambda *a: None,
+                          making=lambda *a: False)
+
+
+def test_exit_logged_for_quit_from_the_tray(tmp_path, monkeypatch):
+    holder = {}
+
+    def tick(runner, st, gate=None, control=None):
+        control.request_quit()
+    bg_env(tmp_path, monkeypatch, tick)
+    assert run_bg(tmp_path, tick) == 0
+    log = bg_log(tmp_path)
+    assert "started" in log and "ended: quit from the tray" in log and log.count("ended:") == 1
+
+
+def test_exit_logged_for_ctrl_c_and_for_errors(tmp_path, monkeypatch):
+    def ctrl_c(*a, **k):
+        raise KeyboardInterrupt
+    bg_env(tmp_path, monkeypatch, ctrl_c)
+    run_bg(tmp_path, ctrl_c)
+    assert "ended: interrupted (Ctrl+C)" in bg_log(tmp_path)
+
+    class Fatal(BaseException):                    # not an Exception, so the loop's per-tick guard lets it through
+        pass
+
+    def boom(*a, **k):
+        raise Fatal("no memory")
+    monkeypatch.setattr(cli, "background_tick", boom)
+    monkeypatch.setattr(cli, "update_step", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bad")))
+    monkeypatch.setattr(cli, "job_running_now", lambda *a: False)
+    with pytest.raises(Fatal):
+        run_bg(tmp_path, boom)
+    assert "ended: error: Fatal: no memory" in bg_log(tmp_path)
+
+
+def test_exit_logged_for_a_signal_and_for_an_update_swap(tmp_path, monkeypatch):
+    handlers = bg_env(tmp_path, monkeypatch, lambda *a, **k: None)
+
+    def tick(runner, st, gate=None, control=None):
+        handlers[0]()                                        # the console-close handler fires, then the process ends
+        raise SystemExit(0)
+    monkeypatch.setattr(cli, "background_tick", tick)
+    with pytest.raises(SystemExit):
+        run_bg(tmp_path, tick)
+    log = bg_log(tmp_path)
+    assert "ended: task ended / signal" in log and log.count("ended:") == 1
+
+    (tmp_path / "work" / "logs" / "background.log").unlink()
+    monkeypatch.setattr(cli, "background_tick", lambda *a, **k: None)
+
+    def swap(*a, **k):
+        raise SystemExit(0)
+    monkeypatch.setattr(cli, "update_step", swap)
+    with pytest.raises(SystemExit):
+        run_bg(tmp_path, None)
+    assert "ended: update (restarting as the new version)" in bg_log(tmp_path)
+
+
+def test_a_failing_log_never_stops_the_exit(tmp_path, monkeypatch):
+    note = cli.ExitNote(tmp_path)
+    monkeypatch.setattr(cli, "log_background_error", lambda *a: (_ for _ in ()).throw(OSError("disk")))
+    note.set("x")
+    note.write()
+    note.write()
+    assert note.done
+
+
+def test_setup_not_finished_is_logged(tmp_path, monkeypatch):
+    from speakstone_worker import setup
+    monkeypatch.setattr(cli, "hide_console", lambda: None)
+    monkeypatch.setattr(cli, "set_title", lambda t: None)
+    monkeypatch.setattr(setup, "is_set_up", lambda i: False)
+    assert cli.background(tmp_path, {"workers": 1}) == 2
+    assert "ended: setup not finished" in bg_log(tmp_path)
+
+
+def test_first_reason_wins():
+    n = cli.ExitNote("x")
+    n.set("a")
+    n.set("b")
+    assert n.reason == "a"
+
+
+def test_updater_logs_before_it_restarts(tmp_path, monkeypatch):
+    monkeypatch.delenv("SSW_NO_UPDATE")
+    logs = []
+    f, c, st, ev = step_setup(tmp_path, log=logs.append)
+    cli.update_step(f, c, st, DrainRunner(running=False, events=ev))
+    assert any("restarting as the new version" in x for x in logs)
 
 
 def test_tray_state_reader_reads_live_settings(tmp_path):

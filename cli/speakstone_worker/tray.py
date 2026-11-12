@@ -15,7 +15,7 @@ from collections import namedtuple
 from . import APP_NAME
 
 # key, label, enabled, checked (None = not a checkbox), default (the left-click / double-click action)
-Item = namedtuple("Item", "key label enabled checked default")
+Item = namedtuple("Item", "key label enabled checked default children", defaults=(None,))
 SEPARATOR = Item(None, "-", False, None, False)
 
 TOGGLES = (("block_fullscreen", "Not while a full-screen game is running"),
@@ -23,12 +23,18 @@ TOGGLES = (("block_fullscreen", "Not while a full-screen game is running"),
            ("auto_update", "Update automatically"))
 
 
+# key, label, minutes (0 = until the user resumes)
+PAUSE_CHOICES = (("pause_15", "15 minutes", 15), ("pause_60", "1 hour", 60), ("pause_120", "2 hours", 120),
+                 ("pause_240", "4 hours", 240), ("pause_0", "Until I resume", 0))
+
+
 def build_menu(version, status, paused, settings, update_version=None):
     """-> list of Item. `settings` maps the toggle keys above to True/False."""
     items = [Item("title", f"{APP_NAME} {version}", False, None, False),
              Item("status", status, False, None, False),
              SEPARATOR,
-             Item("resume" if paused else "pause", "Resume" if paused else "Pause", True, None, False)]
+             (Item("resume", "Resume", True, None, False) if paused else
+              Item("pause", "Pause", True, None, False, tuple(Item(k, label, True, None, False) for k, label, _m in PAUSE_CHOICES)))]
     items += [Item(k, label, True, bool(settings.get(k)), False) for k, label in TOGGLES]
     items.append(SEPARATOR)
     items.append(Item("board", "Open the board", True, None, True))
@@ -88,16 +94,22 @@ class Tray:
                 self.log(f"tray action {key} failed: {type(e).__name__}: {e}")
         return call
 
-    def _menu_items(self):
+    def _items(self, model):
         mi = self.pystray.MenuItem
         out = []
-        for it in self.model():
+        for it in model:
             if it.key is None:
                 out.append(self.pystray.Menu.SEPARATOR)
+                continue
+            if it.children:                                  # a submenu (Pause > how long)
+                out.append(mi(it.label, self.pystray.Menu(*self._items(it.children)), enabled=it.enabled))
                 continue
             out.append(mi(it.label, self._run(it.key), enabled=it.enabled, checked=(None if it.checked is None else
                          (lambda _i, v=it.checked: v)), default=it.default))
         return out
+
+    def _menu_items(self):
+        return self._items(self.model())
 
     def refresh(self):
         try:
