@@ -503,8 +503,12 @@ def step_ffmpeg(env):
 
 def step_enroll(env):
     """Ask the site for a key and hand it straight to `net_worker.py init` (child environment only)."""
-    if env.config_file.exists():
+    if config_has_key(env.config_file):
         return
+    try:                                    # an empty or broken file is not a key: join again instead of waiting forever
+        Path(env.config_file).unlink()
+    except OSError:
+        pass
     info = env.enroll()
     key = info["key"]
     cmd = [env.py, env.install / "net_worker.py", "init", "--config", env.config_file,
@@ -572,6 +576,16 @@ def _any_exists(*paths):
     return any(Path(p).exists() for p in paths)
 
 
+def config_has_key(path):
+    """True when the worker's config file holds a worker key. The file merely existing is not enough: one PC had a
+    config of `{}` and a finished setup, so the app never joined the queue and never said why."""
+    try:
+        key = json.loads(Path(path).read_text(encoding="utf-8")).get("worker_key")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(key, str) and bool(key.strip())
+
+
 def artifact_ok(install, name):
     """Cheap existence check for what a finished step leaves behind. The state file is a note, not proof: a user can
     delete the venv or the model folder, and the step must then run again."""
@@ -594,7 +608,7 @@ def artifact_ok(install, name):
         return _any_exists(i / "ffmpeg" / "ffmpeg.exe", i / "ffmpeg" / "ffmpeg") or (
             sys.platform != "win32" and shutil.which("ffmpeg") is not None)
     if name == "enroll":
-        return (i / "worker_config.json").exists()
+        return config_has_key(i / "worker_config.json")
     return True
 
 

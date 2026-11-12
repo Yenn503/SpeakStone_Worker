@@ -95,7 +95,7 @@ def make_env(tmp_path, calls, logs, fail_at=None, gpu=8192):
         if "python" in c and "install" in c and not (inst / "venv").exists():
             pass
         if len(c) > 2 and c[2] == "init":                    # net_worker.py init writes the config
-            (inst / "worker_config.json").write_text("{}")
+            (inst / "worker_config.json").write_text('{"worker_key": "test-key"}')
         if "venv" in c:
             (inst / "venv" / "Scripts").mkdir(parents=True, exist_ok=True)
             (inst / "venv" / "Scripts" / "python.exe").write_text("")
@@ -802,7 +802,7 @@ def test_set_workers_gate_toggle_and_429_message(tmp_path, monkeypatch):
 
 def test_group_runs_two_with_separate_dirs_and_stops_both(tmp_path, monkeypatch):
     from speakstone_worker import runner as r
-    (tmp_path / "worker_config.json").write_text("{}")
+    (tmp_path / "worker_config.json").write_text('{"worker_key": "test-key"}')
     (tmp_path / "worker_config_2.json").write_text("{}")
     cmds, pids = [], iter([111, 222])
 
@@ -826,7 +826,7 @@ def test_group_runs_two_with_separate_dirs_and_stops_both(tmp_path, monkeypatch)
 
 def test_group_with_one_ignores_second_but_still_knows_it(tmp_path, monkeypatch):
     from speakstone_worker import runner as r
-    (tmp_path / "worker_config.json").write_text("{}")
+    (tmp_path / "worker_config.json").write_text('{"worker_key": "test-key"}')
     (tmp_path / "worker_config_2.json").write_text("{}")
     cmds = []
     g = r.WorkerGroup(tmp_path, 1, popen=lambda c, **k: cmds.append(c) or _Proc(5))
@@ -840,7 +840,7 @@ def test_group_with_one_ignores_second_but_still_knows_it(tmp_path, monkeypatch)
 
 def test_second_without_key_falls_back_to_one(tmp_path):
     from speakstone_worker import runner as r
-    (tmp_path / "worker_config.json").write_text("{}")
+    (tmp_path / "worker_config.json").write_text('{"worker_key": "test-key"}')
     assert r.WorkerGroup(tmp_path, 2).count == 1
 
 
@@ -1309,3 +1309,18 @@ def test_batch_lines_are_grouped_by_voice_sample():
     assert [r["sound_file"] for r, _ in got] == ["0.ogg", "2.ogg", "5.ogg", "1.ogg", "4.ogg", "3.ogg"]
     assert sorted(fp for _, fp in got) == sorted(fp for _, fp in rows)
     assert ns["by_voice"]([]) == []
+
+
+def test_an_empty_config_file_is_not_a_finished_sign_up(tmp_path):
+    """A PC had worker_config.json = {} with setup marked finished: the app never joined and never said why."""
+    from speakstone_worker import setup
+    cfg = tmp_path / "worker_config.json"
+    assert not setup.config_has_key(cfg)
+    cfg.write_text("{}", encoding="utf-8")
+    assert not setup.config_has_key(cfg) and not setup.artifact_ok(tmp_path, "enroll")
+    cfg.write_text("not json", encoding="utf-8")
+    assert not setup.config_has_key(cfg)
+    cfg.write_text('{"worker_key": "  "}', encoding="utf-8")
+    assert not setup.config_has_key(cfg)
+    cfg.write_text('{"worker_key": "k"}', encoding="utf-8")
+    assert setup.config_has_key(cfg) and setup.artifact_ok(tmp_path, "enroll")
