@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -68,7 +69,14 @@ LABELS = {
     "ffmpeg": "Fetching audio tools",
     "enroll": "Joining the queue",
     "check": "Final check",
+    "hf_hub": "Preparing the downloads",        # not in STEPS: a small helper install that starts the second lane
 }
+# Setup runs two lanes at once after the engine is fetched: the pip installs (torch is the big one) and the Hugging
+# Face downloads. They touch different files and different servers, so overlapping them saves most of the wait.
+LANE_A = ("torch", "packages")
+LANE_B = ("model", "extras", "ffmpeg")
+HF_HUB_SPEC = "huggingface_hub>=0.32,<1.0"      # 0.32 is the first with the fast transfer package built in
+HF_FAST_ENV = {"HF_XET_HIGH_PERFORMANCE": "1"}   # setup-time only: use every core and the full link for the downloads
 
 
 class SetupError(Exception):
@@ -204,9 +212,14 @@ def load_state(env):
         return set()
 
 
+_STATE_LOCK = threading.Lock()
+
+
 def save_state(env, done):
-    env.install.mkdir(parents=True, exist_ok=True)
-    env.state_file.write_text(json.dumps({"done": sorted(done)}), encoding="utf-8")
+    # Two lanes finish steps at the same time; one writer at a time keeps the file whole.
+    with _STATE_LOCK:
+        env.install.mkdir(parents=True, exist_ok=True)
+        env.state_file.write_text(json.dumps({"done": sorted(done)}), encoding="utf-8")
 
 
 _PCT = re.compile(r"(\d{1,3})%")
@@ -430,7 +443,7 @@ def step_model(env):
     # The text-emotion folder (qwen*, about 1.2 GB) is never loaded by the worker, so it is not fetched.
     code = (f"from huggingface_hub import snapshot_download; "
             f"snapshot_download('{MODEL_REPO}', local_dir=r'{env.model_dir}', ignore_patterns=['qwen*/*', 'qwen*'])")
-    _run(env, "model", [env.py, "-c", code])
+    _run(env, "model", [env.py, "-c", code], extra_env=HF_FAST_ENV)
 
 
 def extras_code():
@@ -455,7 +468,7 @@ def step_extras(env):
     if extras_cached(env.install):
         return
     # Same cache the worker uses (HF_HOME inside the install folder, set by tool_env and by the runner).
-    _run(env, "extras", [env.py, "-c", extras_code()])
+    _run(env, "extras", [env.py, "-c", extras_code()], extra_env=HF_FAST_ENV)
 
 
 def step_ffmpeg(env):
@@ -592,22 +605,75 @@ def is_set_up(install):
     return all(s in done for s in STEPS if s != "gpu")
 
 
+def step_hf_hub(env):
+    """Just huggingface_hub, so the downloads can start while torch and the other packages are still installing.
+    Run before the lanes (never beside another pip install), and through _pip so the torch pins still apply."""
+    # Held below 1.0, as the engine's own packages require: the newest release would be swapped for an older one by the
+    # engine install while a download in the other lane is still using it.
+    _run(env, "hf_hub", _pip(env, HF_HUB_SPEC))
+
+
 def run_setup(env, only=None):
-    """Run every step not yet done, saving progress after each. Returns the steps run."""
+    """Run every step not yet done, saving progress after each. Returns the steps run.
+
+    Everything up to the engine fetch runs in order. Then two lanes run at once (LANE_A and LANE_B); enroll and check
+    wait for both. If a lane fails, the other finishes the step it is on and starts no more, then the first error is
+    raised, so a re-run resumes from the saved state. SSW_SETUP_SERIAL=1 runs strictly in STEPS order instead."""
     done = verified_done(env.install, load_state(env))
     ran = []
     total = len(STEPS)
-    for i, name in enumerate(STEPS):
-        if only and name not in only:
-            continue
-        env.progress(name, i / total, LABELS[name])
+    idx = {n: i for i, n in enumerate(STEPS)}
+    lock = threading.Lock()
+
+    def run_one(name):
+        env.progress(name, idx[name] / total, LABELS[name])
         if name in done and name not in ("gpu", "folders"):
-            continue
+            return
         FUNCS[name](env)
-        if name != "gpu":
-            done.add(name)
-            save_state(env, done)
-        ran.append(name)
+        with lock:
+            if name != "gpu":
+                done.add(name)
+                save_state(env, set(done))
+            ran.append(name)
+
+    want = [n for n in STEPS if not only or n in only]
+    lane_names = set(LANE_A) | set(LANE_B)
+    split = idx[LANE_A[0]]
+    before = [n for n in want if idx[n] < split]
+    middle = [n for n in want if n in lane_names]
+    after = [n for n in want if idx[n] >= split and n not in lane_names]
+    for name in before:
+        run_one(name)
+    if env.base_env.get("SSW_SETUP_SERIAL") == "1":
+        for name in middle:
+            run_one(name)
+    elif middle:
+        lane_a = [n for n in LANE_A if n in middle]
+        lane_b = [n for n in LANE_B if n in middle]
+        if any(n in lane_b and n not in done for n in ("model", "extras")) and env.py.exists():
+            env.progress("hf_hub", None, LABELS["hf_hub"])
+            step_hf_hub(env)
+        stop, errors = threading.Event(), []
+
+        def lane(names):
+            for n in names:
+                if stop.is_set():
+                    return
+                try:
+                    run_one(n)
+                except BaseException as e:          # re-raised below, after the other lane's current step ends
+                    errors.append(e)
+                    stop.set()
+                    return
+        threads = [threading.Thread(target=lane, args=(ns,), daemon=True) for ns in (lane_a, lane_b) if ns]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            raise errors[0]
+    for name in after:
+        run_one(name)
     if not only and all(s in done for s in STEPS if s != "gpu"):
         shutil.rmtree(env.install / "uv_cache", ignore_errors=True)    # several GB of wheels only a re-install needs
     env.progress("done", 1.0, "Setup finished.")

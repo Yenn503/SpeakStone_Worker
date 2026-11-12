@@ -48,6 +48,22 @@ The worker waits until enough GPU memory is free, claims a job, makes the clips,
 
 Press Ctrl+C, or create a file named `STOP` in the work folder. The worker finishes cleanly and exits.
 
+## Rented cloud GPUs (container)
+
+For a rented Linux machine with an NVIDIA card, use the container in `docker/`. Everything is put in the image
+when it is built, so a new machine pulls the image and starts work: no setup, nothing downloaded at start.
+
+```
+docker build -f docker/Dockerfile -t speakstone-worker .
+docker run --gpus all -e SSW_WORKER_KEY=sswk_... speakstone-worker
+```
+
+- `--build-arg BAKE_MODELS=0` builds a slim image without the model files (about 8 GB smaller). It fetches them
+  once into `/data` (or `/workspace/speakstone`); mount a disk that outlives the machine there and later machines
+  start without downloading.
+- Optional settings: `SSW_MACHINE_NAME`, `SSW_DATA` (where work files and fetched model files go).
+- Stopping the container gives the current job back to the queue.
+
 ## Model hash
 
 ```

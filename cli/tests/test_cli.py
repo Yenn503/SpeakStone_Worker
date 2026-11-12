@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import urllib.error
 from pathlib import Path
@@ -154,7 +155,7 @@ def test_every_pip_install_carries_the_constraint_file(tmp_path):
     env = make_env(tmp_path, calls, [])
     setup.run_setup(env)
     pips = [c for c, _ in calls if "pip" in c and "install" in c]
-    assert len(pips) == 3
+    assert len(pips) == 4                      # huggingface_hub alone, torch, omegaconf/protobuf, then the engine packages
     for c in pips:
         i = c.index("-c")
         assert c[i + 1] == str(env.constraints_file)
@@ -301,6 +302,130 @@ def test_model_download_disables_hf_transfer(tmp_path):
     setup.run_setup(make_env(tmp_path, calls, []))
     model = [e for c, e in calls if "snapshot_download" in " ".join(c)][0]
     assert model["HF_HUB_ENABLE_HF_TRANSFER"] == "0"
+
+
+# ------------------------------------------------------------------ parallel setup lanes
+def _is_torch(c):
+    return "torch==2.8.0+cu128" in c
+
+
+def _is_packages(c):
+    return "-e" in c and "pip" in c
+
+
+def _is_model(c):
+    return "snapshot_download('IndexTeam" in c[-1]
+
+
+def _is_extras(c):
+    return "hf_hub_download(" in c[-1]
+
+
+def _is_hf_only(c):
+    return "pip" in c and "install" in c and c[-1] == setup.HF_HUB_SPEC and "-e" not in c
+
+
+def wrap_run(env, hook):
+    real = env.run
+
+    def run(cmd, e, cwd, on_line):
+        hook([str(x) for x in cmd])
+        return real(cmd, e, cwd, on_line)
+    env.run = run
+
+
+def test_lanes_really_overlap(tmp_path):
+    env = make_env(tmp_path, [], [])
+    torch_in, model_in = threading.Event(), threading.Event()
+    met = {}
+
+    def hook(c):
+        if _is_torch(c):
+            torch_in.set()
+            met["torch_saw_model"] = model_in.wait(5)
+        elif _is_model(c):
+            model_in.set()
+            met["model_saw_torch"] = torch_in.wait(5)
+    wrap_run(env, hook)
+    setup.run_setup(env)
+    assert met == {"torch_saw_model": True, "model_saw_torch": True}
+    assert setup.is_set_up(env.install)
+
+
+def test_hf_hub_installed_before_the_download_lane_starts(tmp_path):
+    calls = []
+    setup.run_setup(make_env(tmp_path, calls, []))
+    cmds = [c for c, _ in calls]
+    hf = next(i for i, c in enumerate(cmds) if _is_hf_only(c))
+    assert hf < next(i for i, c in enumerate(cmds) if _is_model(c))
+    assert hf < next(i for i, c in enumerate(cmds) if _is_torch(c))      # and before any other pip install
+    assert hf < next(i for i, c in enumerate(cmds) if _is_packages(c))
+
+
+def test_failure_in_download_lane_lets_the_other_lane_step_finish(tmp_path):
+    calls = []
+    env = make_env(tmp_path, calls, [], fail_at="snapshot_download")
+    wrap_run(env, lambda c: time.sleep(0.4) if _is_torch(c) else None)    # torch is still running when the model fails
+    with pytest.raises(setup.SetupError, match="voice model"):
+        setup.run_setup(env)
+    state = setup.load_state(env)
+    assert "torch" in state                                              # its current step finished
+    assert not state & {"packages", "model", "extras", "ffmpeg", "enroll", "check"}
+    assert json.loads(env.state_file.read_text())["done"] == sorted(state)
+    calls.clear()
+    ran = setup.run_setup(make_env(tmp_path, calls, []))
+    assert set(ran) >= {"packages", "model", "extras", "ffmpeg", "enroll", "check"} and "torch" not in ran
+    assert not any(_is_torch(c) for c, _ in calls)
+    assert setup.is_set_up(env.install)
+
+
+def test_failure_in_pip_lane_lets_the_download_finish_and_raises(tmp_path):
+    env = make_env(tmp_path, [], [], fail_at="torch==2.8.0+cu128")
+    wrap_run(env, lambda c: time.sleep(0.3) if _is_model(c) else None)
+    with pytest.raises(setup.SetupError, match="graphics-card libraries"):
+        setup.run_setup(env)
+    state = setup.load_state(env)
+    assert "model" in state and "torch" not in state and "packages" not in state and "extras" not in state
+
+
+def test_nothing_left_to_do_runs_no_commands(tmp_path):
+    setup.run_setup(make_env(tmp_path, [], []))
+    calls = []
+    assert setup.run_setup(make_env(tmp_path, calls, [])) == ["gpu", "folders"]     # the two cheap checks always run
+    assert calls == []
+
+
+def test_only_runs_one_lane_step(tmp_path):
+    setup.run_setup(make_env(tmp_path, [], []))
+    import shutil
+    shutil.rmtree(tmp_path / "inst" / "hf")
+    calls = []
+    ran = setup.run_setup(make_env(tmp_path, calls, []), only=("extras",))
+    assert ran == ["extras"]
+    assert any(_is_extras(c) for c, _ in calls) and not any(_is_torch(c) or _is_model(c) for c, _ in calls)
+
+
+def test_serial_switch_keeps_the_old_order(tmp_path):
+    calls = []
+    env = make_env(tmp_path, calls, [])
+    env.base_env["SSW_SETUP_SERIAL"] = "1"
+    setup.run_setup(env)
+    cmds = [c for c, _ in calls]
+    pos = [next(i for i, c in enumerate(cmds) if f(c)) for f in (_is_torch, _is_packages, _is_model, _is_extras)]
+    assert pos == sorted(pos)
+    assert not any(_is_hf_only(c) for c in cmds)                       # packages brings it in, as before
+    assert setup.is_set_up(env.install)
+
+
+def test_fast_hf_transfer_only_for_setup_downloads(tmp_path):
+    from speakstone_worker.runner import WorkerRunner
+    calls = []
+    setup.run_setup(make_env(tmp_path, calls, []))
+    fast = [(c, e) for c, e in calls if _is_model(c) or _is_extras(c)]
+    assert len(fast) == 2 and all(e["HF_XET_HIGH_PERFORMANCE"] == "1" for _, e in fast)
+    assert all(e["HF_HUB_ENABLE_HF_TRANSFER"] == "0" for _, e in fast)
+    assert not any("HF_XET_HIGH_PERFORMANCE" in e for c, e in calls if not (_is_model(c) or _is_extras(c)))
+    assert "HF_XET_HIGH_PERFORMANCE" not in WorkerRunner(tmp_path).environment({})
 
 
 # ------------------------------------------------------------------ board

@@ -90,30 +90,61 @@ def worker_label(install):
 # ---------------------------------------------------------------- setup with a progress board
 def run_setup_ui(console, install, base):
     steps, done, cur = list(setup.STEPS), set(setup.load_state(setup.Env(install, paths.resource_dir()))), [None]
-    view = {"frac": None, "line": "", "dl": "", "t0": time.time()}
+    # Two steps can now run at once (setup.LANE_A / LANE_B), so each active step keeps its own bar, line and speed,
+    # and the board shows the most recently updated one with the other's short status on the same line.
+    ui_lock = threading.RLock()
+    active = {}                                  # step -> {"frac", "line", "dl", "t0"}
+    dl_by_thread = {}                            # a download's speed text, picked up by the progress call in the same thread
     live = Live(console=console, refresh_per_second=4, screen=VT["on"])     # alternate screen: nothing is left behind the menu
+    lane_steps = set(setup.LANE_A) | set(setup.LANE_B)
 
     def redraw(error=None):
-        live.update(board.render_setup(steps, setup.LABELS, done, cur[0], view["frac"], view["line"], view["dl"], error))
+        with ui_lock:
+            cur_view = active.get(cur[0]) or {"frac": None, "line": "", "dl": ""}
+            labels = dict(setup.LABELS)
+            others = []
+            for s, v in active.items():
+                if s == cur[0]:
+                    continue
+                labels[s] = labels.get(s, s) + "  (running)"
+                pct = f" {round(v['frac'] * 100)}%" if v["frac"] is not None else ""
+                others.append(setup.LABELS.get(s, s).split(" (")[0] + pct)
+            line = cur_view["line"]
+            if others:
+                line = " / ".join(others) + "  |  " + line
+            live.update(board.render_setup(steps, labels, done, cur[0], cur_view["frac"], line, cur_view["dl"], error))
 
     def progress(step, frac, msg):
         if step == "done":
             return
-        if step != cur[0]:
-            if cur[0]:
-                done.add(cur[0])
-            cur[0], view["frac"], view["dl"], view["t0"] = step, None, "", time.time()
-        if frac is not None and step not in ("gpu",):
-            view["frac"] = frac if step in ("uv", "index_tts", "ffmpeg", "model", "extras") else view["frac"]
-        if msg:
-            view["line"] = msg
-        redraw()
+        with ui_lock:
+            if step not in active:
+                if step not in lane_steps:               # a step that runs alone ends everything before it
+                    done.update(active)
+                    active.clear()
+                else:                                    # a lane step ends when its done-marker is saved
+                    done.update(setup.load_state(setup.Env(install, paths.resource_dir())))
+                    active.pop("hf_hub", None)
+                    for s in [s for s in active if s in done]:
+                        del active[s]
+                active[step] = {"frac": None, "line": "", "dl": "", "t0": time.time()}
+            v = active[step]
+            cur[0] = step
+            if frac is not None and step not in ("gpu",):
+                v["frac"] = frac if step in ("uv", "index_tts", "ffmpeg", "model", "extras") else v["frac"]
+            if step in lane_steps or step == "index_tts":
+                v["dl"] = dl_by_thread.get(threading.get_ident(), v["dl"]) if frac is not None else v["dl"]
+            if msg:
+                v["line"] = msg
+            redraw()
 
     def download(url, dest, cb):
+        t0 = time.time()
+
         def inner(frac, got, total):
             if total:
-                rate = got / max(0.5, time.time() - view["t0"])
-                view["dl"] = f"{got / 1e6:.0f} of {total / 1e6:.0f} MB  {rate / 1e6:.1f} MB/s"
+                rate = got / max(0.5, time.time() - t0)
+                dl_by_thread[threading.get_ident()] = f"{got / 1e6:.0f} of {total / 1e6:.0f} MB  {rate / 1e6:.1f} MB/s"
             cb(frac, got, total)
         setup.real_download(url, dest, inner)
 

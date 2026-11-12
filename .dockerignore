@@ -1,0 +1,6 @@
+# The image needs only the three worker files and docker/. Keep everything else out of the build.
+*
+!net_worker.py
+!indextts2_worker.py
+!runpod_worker.py
+!docker/
