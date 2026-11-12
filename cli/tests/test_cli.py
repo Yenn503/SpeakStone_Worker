@@ -507,6 +507,12 @@ def test_windows_task_xml_and_commands():
     xml = service.build_task_xml(prog, args)
     assert "LogonTrigger" in xml and "--background" in xml and r"C:\Apps\SpeakStoneWorker.exe" in xml
     assert "LeastPrivilege" in xml and "<Hidden>true</Hidden>" in xml
+    # the task starts the app through the console host in headless mode, so no empty black window opens at log-on
+    wprog, wargs = service.windowless(r"C:\My Apps\SpeakStoneWorker.exe", ["--background"], {"SystemRoot": r"D:\Win"})
+    assert wprog == r"D:\Win\System32\conhost.exe" and wargs == ["--headless", r"C:\My Apps\SpeakStoneWorker.exe", "--background"]
+    xml = service.build_task_xml(wprog, wargs)
+    assert r"<Command>D:\Win\System32\conhost.exe</Command>" in xml
+    assert r'--headless "C:\My Apps\SpeakStoneWorker.exe" --background' in xml.replace("&quot;", '"')
 
 
 def test_install_windows_calls_schtasks_only(tmp_path):

@@ -8,6 +8,7 @@ Linux: a systemd --user unit running the same `--background` mode.
 
 The `build_*` functions are pure. `install`/`uninstall` take a `runner` so tests never touch the machine.
 """
+import os
 import shlex
 import subprocess
 import sys
@@ -23,6 +24,14 @@ def launch_command(frozen=None, executable=None):
     frozen = getattr(sys, "frozen", False) if frozen is None else frozen
     exe = executable or sys.executable
     return (exe, ["--background"]) if frozen else (exe, ["-m", "speakstone_worker", "--background"])
+
+
+def windowless(program, args, environ=None):
+    """(program, [args]) that runs a console program with no window: Windows' own console host in headless mode. The app
+    is a console program, so started straight from the Scheduled Task it opened an empty black window at every log-on
+    (the task's Hidden setting only hides the task in the list, not its window)."""
+    root = (environ if environ is not None else os.environ).get("SystemRoot") or r"C:\Windows"
+    return (root + r"\System32\conhost.exe", ["--headless", str(program), *args])
 
 
 def build_task_xml(program, args):
@@ -96,7 +105,7 @@ def install(data_dir, runner=subprocess.run, platform=None, unit_dir=None, **lau
     data_dir.mkdir(parents=True, exist_ok=True)
     if platform == "win32":
         xml = data_dir / "task.xml"
-        xml.write_text(build_task_xml(program, args), encoding="utf-16")
+        xml.write_text(build_task_xml(*windowless(program, args)), encoding="utf-16")
         ok = _ok(runner, schtasks_create(xml))
         if ok:                                       # also start it for this session so no log-off is needed
             _ok(runner, ["schtasks", "/Run", "/TN", TASK_NAME])
