@@ -227,6 +227,7 @@ class WorkerRunner:
         e["INDEXTTS2_PYTHON"] = str(self.python)
         e["INDEXTTS2_DIR"] = str(self.install / "IndexTTS-2")
         e["HF_HOME"] = str(self.install / "hf")      # ONE cache for every worker, where setup pre-fetched the files
+        e["HF_HUB_CACHE"] = str(self.install / "hf" / "hub")   # absolute: the engine's own default is relative to the job folder
         e["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
         e.pop("HF_HUB_OFFLINE", None)                  # never offline: a missing file is fetched, a cached one only checked
         e.pop("TRANSFORMERS_OFFLINE", None)

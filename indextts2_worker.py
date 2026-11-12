@@ -38,6 +38,38 @@ import torch
 
 import runpod_worker as rw   # shared helpers: level + encode, quality gate, seeds, validity check
 
+
+def hf_cache_dir(env):
+    """The folder the extra model files are kept in. An explicit HF_HUB_CACHE wins, then <HF_HOME>/hub, then the
+    library's own default (None)."""
+    if env.get("HF_HUB_CACHE"):
+        return env["HF_HUB_CACHE"]
+    if env.get("HF_HOME"):
+        return str(Path(env["HF_HOME"]) / "hub")
+    return None
+
+
+def pin_hf_cache(env=None):
+    """The engine sets HF_HUB_CACHE to './checkpoints/hf_cache' when it is imported: a path relative to the current
+    folder. The worker runs each job in that job's own folder, so every job looked in an empty folder, fetched several
+    GB again and deleted them with the job. huggingface_hub reads the setting once, when it is first imported, so
+    importing it here, with an absolute path, makes the engine's later change harmless."""
+    env = os.environ if env is None else env
+    cache = hf_cache_dir(env)
+    if cache:
+        cache = str(Path(cache).resolve())
+        env["HF_HUB_CACHE"] = cache
+    if env is os.environ:
+        try:
+            # the package loads its parts lazily: name the constants module, or the setting is still unread
+            import huggingface_hub.constants  # noqa: F401  (must happen before indextts.infer_v2 is imported)
+        except ImportError:
+            pass
+    return cache
+
+
+HF_CACHE = pin_hf_cache()
+
 ENGINE = "indextts2"
 MODEL_REPO = "IndexTeam/IndexTTS-2"
 MODEL_DIR = Path(os.environ.get("INDEXTTS2_DIR", str(Path(__file__).resolve().parent / "models" / "IndexTTS-2")))
@@ -191,6 +223,13 @@ def load_model(device):
         def inference(self, *args, **kwargs):
             return {}
     indextts.infer_v2.QwenEmotion = DummyQwenEmotion
+    if HF_CACHE:
+        os.environ["HF_HUB_CACHE"] = HF_CACHE          # the import above overwrote it; put the real folder back
+    try:
+        from huggingface_hub import constants as _hfc
+        print(f"[IndexTTS-2] model cache: {_hfc.HF_HUB_CACHE}", flush=True)
+    except ImportError:
+        pass
     from indextts.infer_v2 import IndexTTS2
     tts = IndexTTS2(cfg_path=str(MODEL_DIR / "config.yaml"), model_dir=str(MODEL_DIR), use_fp16=(device == "cuda"),
                     device=device, use_cuda_kernel=os.environ.get("IDX2_CUDA_KERNEL") == "1",
