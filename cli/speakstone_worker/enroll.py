@@ -8,7 +8,11 @@ class EnrollError(Exception):
     """Message is written for the person at the keyboard. Never contains a key."""
 
 
-def friendly_error(status):
+def friendly_error(status, code=None):
+    if status == 422 and code == "gpu_too_small":
+        return "This PC needs an NVIDIA graphics card with at least 8 GB of memory."
+    if status == 503 and code == "network_full":
+        return "The network is full right now. Please try again tomorrow."
     if status == 429:
         return "Too many sign-ups from this network just now. Please try again in a little while."
     if status == 503:
@@ -16,6 +20,16 @@ def friendly_error(status):
     if status == 422:
         return "The site did not accept this PC's details (graphics card or system name). Nothing was changed."
     return f"The site answered with an unexpected error (HTTP {status}). Please try again later."
+
+
+def _error_code(err):
+    """The `code` field of the server's JSON error body, or None. Only this short word is used, never the body."""
+    try:
+        data = json.loads(err.read(10_000).decode("utf-8"))
+        code = data.get("code") if isinstance(data, dict) else None
+        return code if isinstance(code, str) and len(code) < 40 else None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opener=urllib.request.urlopen, timeout=30):
@@ -29,7 +43,7 @@ def enroll(api_base, machine_name, gpu, vram_mib, os_name, worker_version, opene
             status = getattr(r, "status", 201)
             data = json.loads(r.read(100_000).decode("utf-8"))
     except urllib.error.HTTPError as e:
-        raise EnrollError(friendly_error(e.code)) from None
+        raise EnrollError(friendly_error(e.code, _error_code(e))) from None
     except (urllib.error.URLError, OSError, TimeoutError):
         raise EnrollError("Could not reach the SpeakStone site. Check your internet connection and try again.") from None
     except ValueError:

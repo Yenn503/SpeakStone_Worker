@@ -42,9 +42,17 @@ EXTRA_FILES = (
     ("amphion/MaskGCT", "semantic_codec/model.safetensors"),
     ("funasr/campplus", "campplus_cn_common.bin"),
 )
+# What must be present for each prefetched repo (one snapshot holding all of these files counts as complete).
+EXTRAS_NEED = {"models--facebook--w2v-bert-2.0": ["config.json", "preprocessor_config.json", "model.safetensors"],
+               "models--nvidia--bigvgan_v2_22khz_80band_256x": ["config.json", "bigvgan_generator.pt"],
+               "models--amphion--MaskGCT": ["semantic_codec/model.safetensors"],
+               "models--funasr--campplus": ["campplus_cn_common.bin"]}
+MODEL_FILES = ("config.yaml", "gpt.pth", "s2mel.pth", "bpe.model")
+TORCH_VERSION = "2.8.0+cu128"
 WORKER_FILES = ("net_worker.py", "indextts2_worker.py", "runpod_worker.py")
 
-STEPS = ("gpu", "folders", "worker_files", "uv", "python", "index_tts", "packages", "torch", "model", "extras", "ffmpeg",
+# torch comes before the engine so the engine install finds the pinned build already there and cannot swap it.
+STEPS = ("gpu", "folders", "worker_files", "uv", "python", "index_tts", "torch", "packages", "model", "extras", "ffmpeg",
          "enroll", "check")
 LABELS = {
     "gpu": "Checking your graphics card",
@@ -116,6 +124,10 @@ class Env:
     @property
     def work_dir(self):
         return self.install / "work"
+
+    @property
+    def constraints_file(self):
+        return self.install / "constraints.txt"
 
     @property
     def state_file(self):
@@ -290,7 +302,7 @@ def step_python(env):
 
 
 def step_index_tts(env):
-    if (env.engine_dir / "pyproject.toml").exists():
+    if _engine_ok(env.install):
         return
     z = env.install / "index-tts.zip"
     env.download(INDEX_TTS_URL, z, lambda f, g=0, t=0: env.progress("index_tts", f, ""))
@@ -304,20 +316,120 @@ def step_index_tts(env):
     z.unlink(missing_ok=True)
 
 
+def write_constraints(env):
+    """The two torch pins in a file every `uv pip install` is given with -c, so no later install can move them."""
+    env.install.mkdir(parents=True, exist_ok=True)
+    env.constraints_file.write_text("\n".join(TORCH_PINS) + "\n", encoding="utf-8")
+
+
+def _pip(env, *args, index=None):
+    """`uv pip install` for the install's own Python, always held to the torch pins. Only the torch install itself names
+    the cu128 index: uv takes a package from the first index that has it, and that index also carries a few old builds
+    of common packages (numpy, pillow), so listing it for the other installs could make them fail to resolve. Torch is
+    installed first, so the pin is already met when the engine is installed; if it ever is not, the install stops
+    instead of fetching a different torch."""
+    write_constraints(env)
+    cmd = [env.uv, "pip", "install", "--python", env.py, "-c", env.constraints_file, *args]
+    return cmd + [index, TORCH_INDEX] if index else cmd
+
+
+def torch_version(env):
+    """Version string of the torch in the install's Python, or None when it is missing or will not import."""
+    if not env.py.exists():
+        return None
+    lines = []
+    try:
+        rc = env.run([env.py, "-c", "import torch;print(torch.__version__)"], env.tool_env(), None, lines.append)
+    except OSError:
+        return None
+    if rc != 0:
+        return None
+    return lines[-1].strip() if lines else None
+
+
 def step_packages(env):
-    _run(env, "packages", [env.uv, "pip", "install", "--python", env.py, "-e", env.engine_dir,
-                           "soundfile", "numpy", "huggingface_hub"])
+    _run(env, "packages", _pip(env, "-e", env.engine_dir, "soundfile", "numpy", "huggingface_hub"))
 
 
 def step_torch(env):
     # Pinned. Never `--reinstall torch` unpinned: it pulls the newest release (2.11 at the time), which breaks the engine.
-    _run(env, "torch", [env.uv, "pip", "install", "--python", env.py, *TORCH_PINS, "--index-url", TORCH_INDEX])
-    _run(env, "torch", [env.uv, "pip", "install", "--python", env.py, "--upgrade", "omegaconf>=2.3", "protobuf<3.21"])
+    if torch_version(env) == TORCH_VERSION:
+        env.progress("torch", 1, "Right version already installed, skipping")
+    else:
+        _run(env, "torch", _pip(env, *TORCH_PINS, index="--index-url"))
+    _run(env, "torch", _pip(env, "--upgrade", "omegaconf>=2.3", "protobuf<3.21"))
+
+
+def _env_get(env, name):
+    return env.base_env.get(name) or ""
+
+
+def user_hf_hub(env):
+    """The user's own Hugging Face cache (not the install's): HF_HUB_CACHE, else HF_HOME/hub, else ~/.cache/huggingface/hub."""
+    if _env_get(env, "HF_HUB_CACHE"):
+        return Path(_env_get(env, "HF_HUB_CACHE"))
+    if _env_get(env, "HF_HOME"):
+        return Path(_env_get(env, "HF_HOME")) / "hub"
+    home = _env_get(env, "USERPROFILE") or _env_get(env, "HOME") or str(Path.home())
+    return Path(home) / ".cache" / "huggingface" / "hub"
+
+
+def _nonempty(p):
+    try:
+        return p.is_file() and p.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def model_complete(model_dir):
+    return all(_nonempty(Path(model_dir) / f) for f in MODEL_FILES)
+
+
+def _engine_ok(install):
+    try:
+        return (Path(install) / "index-tts" / "pyproject.toml").stat().st_size > 100
+    except OSError:
+        return False
+
+
+def _repo_complete(repo_dir, files):
+    """A cache repo folder with a snapshot holding every needed file and no half-finished blob."""
+    repo_dir = Path(repo_dir)
+    if any(repo_dir.glob("blobs/*.incomplete")):
+        return False
+    return any(all(_nonempty(sn / f) for f in files) for sn in (repo_dir / "snapshots").glob("*"))
+
+
+def _copy_tree(src, dst, ignore=None):
+    """Copy a folder; keep the cache's links where the OS allows, otherwise copy the real files."""
+    try:
+        shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True, ignore=ignore)
+    except (OSError, shutil.Error):
+        shutil.rmtree(dst, ignore_errors=True)
+        shutil.copytree(src, dst, symlinks=False, dirs_exist_ok=True, ignore=ignore)
+
+
+def _model_sources(env):
+    out = []
+    if _env_get(env, "SSW_MODEL_DIR"):
+        out.append(Path(_env_get(env, "SSW_MODEL_DIR")))
+    out += sorted((user_hf_hub(env) / ("models--" + MODEL_REPO.replace("/", "--")) / "snapshots").glob("*"))
+    return out
 
 
 def step_model(env):
+    if model_complete(env.model_dir):
+        env.progress("model", 1, "Voice model already here, skipping")
+        return
+    for src in _model_sources(env):
+        if model_complete(src):
+            env.progress("model", None, "Found on this PC, copying")
+            _copy_tree(src, env.model_dir, ignore=shutil.ignore_patterns("qwen*"))
+            if model_complete(env.model_dir):
+                return
+    # The text-emotion folder (qwen*, about 1.2 GB) is never loaded by the worker, so it is not fetched.
     code = (f"from huggingface_hub import snapshot_download; "
-            f"snapshot_download('{MODEL_REPO}', local_dir=r'{env.model_dir}')")
+            f"snapshot_download('{MODEL_REPO}', local_dir=r'{env.model_dir}', ignore_patterns=['qwen*/*', 'qwen*'])")
     _run(env, "model", [env.py, "-c", code])
 
 
@@ -331,6 +443,17 @@ def extras_code():
 
 
 def step_extras(env):
+    hub = env.install / "hf" / "hub"
+    mine = user_hf_hub(env)
+    if mine.resolve() != hub.resolve():
+        for repo, files in EXTRAS_NEED.items():
+            if _repo_complete(hub / repo, files) or not _repo_complete(mine / repo, files):
+                continue
+            env.progress("extras", None, "Found on this PC, copying " + repo.split("--", 1)[1].replace("--", "/"))
+            hub.mkdir(parents=True, exist_ok=True)
+            _copy_tree(mine / repo, hub / repo)
+    if extras_cached(env.install):
+        return
     # Same cache the worker uses (HF_HOME inside the install folder, set by tool_env and by the runner).
     _run(env, "extras", [env.py, "-c", extras_code()])
 
@@ -422,17 +545,56 @@ FUNCS = {"gpu": step_gpu, "folders": step_folders, "worker_files": step_worker_f
          "model": step_model, "extras": step_extras, "ffmpeg": step_ffmpeg, "enroll": step_enroll, "check": step_check}
 
 
+def _any_exists(*paths):
+    return any(Path(p).exists() for p in paths)
+
+
+def artifact_ok(install, name):
+    """Cheap existence check for what a finished step leaves behind. The state file is a note, not proof: a user can
+    delete the venv or the model folder, and the step must then run again."""
+    i = Path(install)
+    if name == "worker_files":
+        return (i / "net_worker.py").exists()
+    if name == "uv":
+        return _any_exists(i / "tools" / "uv.exe", i / "tools" / "uv")
+    if name in ("python", "torch", "check"):
+        return _any_exists(i / "venv" / "Scripts" / "python.exe", i / "venv" / "bin" / "python")
+    if name == "packages":
+        return _engine_ok(i) and _any_exists(i / "venv" / "Scripts" / "python.exe", i / "venv" / "bin" / "python")
+    if name == "index_tts":
+        return _engine_ok(i)
+    if name == "model":
+        return model_complete(i / "IndexTTS-2")
+    if name == "extras":
+        return extras_cached(i)
+    if name == "ffmpeg":
+        return _any_exists(i / "ffmpeg" / "ffmpeg.exe", i / "ffmpeg" / "ffmpeg") or (
+            sys.platform != "win32" and shutil.which("ffmpeg") is not None)
+    if name == "enroll":
+        return (i / "worker_config.json").exists()
+    return True
+
+
+def verified_done(install, done):
+    """`done` minus every step whose files are gone. Losing the venv also drops what was installed into it."""
+    keep = {s for s in done if artifact_ok(install, s)}
+    if "python" in done and "python" not in keep:
+        keep -= {"torch", "packages", "check"}
+    return keep
+
+
 def is_set_up(install):
     try:
         done = set(json.loads((Path(install) / "setup_state.json").read_text(encoding="utf-8")).get("done", []))
     except (OSError, ValueError):
         return False
+    done = verified_done(install, done)
     return all(s in done for s in STEPS if s != "gpu")
 
 
 def run_setup(env, only=None):
     """Run every step not yet done, saving progress after each. Returns the steps run."""
-    done = load_state(env)
+    done = verified_done(env.install, load_state(env))
     ran = []
     total = len(STEPS)
     for i, name in enumerate(STEPS):
@@ -446,6 +608,8 @@ def run_setup(env, only=None):
             done.add(name)
             save_state(env, done)
         ran.append(name)
+    if not only and all(s in done for s in STEPS if s != "gpu"):
+        shutil.rmtree(env.install / "uv_cache", ignore_errors=True)    # several GB of wheels only a re-install needs
     env.progress("done", 1.0, "Setup finished.")
     return ran
 
@@ -453,15 +617,7 @@ def run_setup(env, only=None):
 def extras_cached(install):
     """True when every file the engine would fetch on its first job is already in <install>/hf. Pure file check."""
     hub = Path(install) / "hf" / "hub"
-    need = {"models--facebook--w2v-bert-2.0": ["config.json", "preprocessor_config.json", "model.safetensors"],
-            "models--nvidia--bigvgan_v2_22khz_80band_256x": ["config.json", "bigvgan_generator.pt"],
-            "models--amphion--MaskGCT": ["semantic_codec/model.safetensors"],
-            "models--funasr--campplus": ["campplus_cn_common.bin"]}
-    for repo, files in need.items():
-        snaps = list((hub / repo / "snapshots").glob("*"))
-        if not any(all((sn / f).exists() for f in files) for sn in snaps):
-            return False
-    return True
+    return all(_repo_complete(hub / repo, files) for repo, files in EXTRAS_NEED.items())
 
 
 def forget_extras(install):

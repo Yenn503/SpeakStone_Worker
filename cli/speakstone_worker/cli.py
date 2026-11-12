@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
@@ -74,9 +75,9 @@ def make_console():
 def worker_version(install):
     try:
         m = re.search(r'WORKER_VERSION\s*=\s*"([^"]+)"', (install / "net_worker.py").read_text(encoding="utf-8"))
-        return m.group(1) if m else "1.0.1"
+        return m.group(1) if m else "1.1.0"
     except OSError:
-        return "1.0.1"
+        return "1.1.0"
 
 
 def worker_label(install):
@@ -368,7 +369,64 @@ def hide_console():
             pass
 
 
-def background_tick(runner, st, now=None, readers=None):
+# Exit codes the worker uses when restarting cannot help (key refused and the like): wait long, then try once more.
+NO_RESTART_CODES = (3, 4, 5)
+NO_RESTART_WAIT = 30 * 60
+CRASH_BACKOFF_FIRST = 30
+CRASH_BACKOFF_MAX = 10 * 60
+
+
+class RestartGate:
+    """Decides when a worker that exited may be started again, so a refused key is not retried every few seconds.
+    The worker's own exit code is the only input; `clock` is injected for tests."""
+
+    def __init__(self, clock=time.time):
+        self.clock = clock
+        self.until = 0.0
+        self.crashes = 0
+        self.seen_running = False
+
+    def blocked(self):
+        return self.clock() < self.until
+
+    def observe(self, running, exit_code):
+        """Call once per tick with whether the worker runs and, when it does not, how its process ended."""
+        if running:
+            self.seen_running = True
+            return
+        if not self.seen_running:
+            return
+        self.seen_running = False
+        if exit_code in (None, 0):
+            self.crashes = 0
+            return
+        if exit_code in NO_RESTART_CODES:
+            self.until = self.clock() + NO_RESTART_WAIT
+            return
+        self.until = self.clock() + min(CRASH_BACKOFF_MAX, CRASH_BACKOFF_FIRST * 2 ** self.crashes)
+        self.crashes += 1
+
+
+def _group_exit_code(runner):
+    """First non-zero exit code among the workers that have ended, else 0 (None if there is nothing to read)."""
+    rs = getattr(runner, "runners", None) or [runner]
+    codes = [getattr(r, "exit_code", None) for r in rs]
+    bad = [c for c in codes if c not in (None, 0)]
+    return bad[0] if bad else (0 if any(c == 0 for c in codes) else None)
+
+
+def log_background_error(install, text):
+    """One line in work/logs/background.log. Best effort: logging must never be the thing that stops the service."""
+    try:
+        d = Path(install) / "work" / "logs"
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "background.log", "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text + "\n")
+    except OSError:
+        pass
+
+
+def background_tick(runner, st, now=None, readers=None, gate=None):
     """One decision. Returns the action taken. Pure apart from starting/stopping the worker."""
     r = readers or {}
     idle_s = (r.get("idle_seconds") or idle.idle_seconds)()
@@ -379,8 +437,15 @@ def background_tick(runner, st, now=None, readers=None):
         mode, idle_s, runner.nice = "now", 0, True
     action = idle.decide(mode, runner.running, idle_s, st["idle_minutes"], (r.get("fullscreen") or idle.fullscreen_busy)(),
                          (r.get("battery") or idle.on_battery)(), paused, st["block_fullscreen"], st["block_on_battery"])
+    if gate is not None:
+        # a stop we asked for (idle ended, pause) is not a crash, whatever code a killed process leaves
+        gate.observe(runner.running, 0 if runner.stop_asked_at or runner.running else _group_exit_code(runner))
+        if action == "start" and gate.blocked():
+            action = "wait"
     if action == "start":
         runner.start()
+        if gate is not None:
+            gate.seen_running = True           # a refused key exits within seconds, before the next tick sees it run
     elif action == "stop":
         runner.request_stop()
     runner.poll_stop()
@@ -402,9 +467,13 @@ def background(install, st):
     setup.sync_worker_files(install, paths.resource_dir())
     runner = WorkerGroup(install, st["workers"])
     install_close_handlers(runner.shutdown_fast)
+    gate = RestartGate()
     try:
         while True:
-            background_tick(runner, st)
+            try:
+                background_tick(runner, st, gate=gate)
+            except Exception as e:                  # one odd tick must not end the service
+                log_background_error(install, f"tick failed: {type(e).__name__}: {e}")
             time.sleep(5)
     except KeyboardInterrupt:
         pass

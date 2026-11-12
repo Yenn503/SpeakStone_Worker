@@ -54,6 +54,19 @@ def test_enroll_error_mapping(code, word):
     assert word in str(e.value) and KEY not in str(e.value)
 
 
+@pytest.mark.parametrize("status,body,text", [
+    (422, b'{"code":"gpu_too_small"}', "at least 8 GB of memory"),
+    (503, b'{"code":"network_full"}', "try again tomorrow"),
+    (429, b'{"code":"rate"}', "Too many"),
+    (422, b'not json', "did not accept")])
+def test_enroll_maps_server_codes(status, body, text):
+    def opener(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, status, "x", {}, io.BytesIO(body))
+    with pytest.raises(enroll.EnrollError) as e:
+        enroll.enroll("https://x.test", "PC", "g", 8192, "os", "1", opener=opener)
+    assert text in str(e.value) and "HTTP" not in str(e.value)
+
+
 def test_enroll_unreachable():
     def opener(req, timeout=0):
         raise urllib.error.URLError("down")
@@ -85,6 +98,12 @@ def make_env(tmp_path, calls, logs, fail_at=None, gpu=8192):
         if "venv" in c:
             (inst / "venv" / "Scripts").mkdir(parents=True, exist_ok=True)
             (inst / "venv" / "Scripts" / "python.exe").write_text("")
+        if "snapshot_download(" in " ".join(c) and "IndexTTS-2" in " ".join(c):
+            for f in setup.MODEL_FILES:
+                (inst / "IndexTTS-2").mkdir(parents=True, exist_ok=True)
+                (inst / "IndexTTS-2" / f).write_text("x")
+        if "hf_hub_download(" in " ".join(c):
+            fake_hf_cache(inst)
         if fail_at and fail_at in " ".join(c):
             return 1
         on_line("ok")
@@ -95,13 +114,15 @@ def make_env(tmp_path, calls, logs, fail_at=None, gpu=8192):
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(dest, "w") as z:
-            z.writestr("uv.exe" if "uv" in url else ("it/pyproject.toml" if "index-tts" in url else "bin/ffmpeg.exe"), "x")
+            z.writestr("uv.exe" if "uv" in url else ("it/pyproject.toml" if "index-tts" in url else "bin/ffmpeg.exe"),
+                       "x" * 200)
 
     def do_enroll():
         return {"key": KEY, "label": "Brave Otter", "worker_id": "w1", "tier": "new"}
 
     return setup.Env(inst, res, download=download, run=run, enroll=do_enroll, gpu_total_mib=lambda: gpu,
-                     progress=lambda s, f, m: logs.append((s, m)), is_win=True)
+                     progress=lambda s, f, m: logs.append((s, m)), is_win=True,
+                     base_env={"USERPROFILE": str(tmp_path / "nohome"), "HOME": str(tmp_path / "nohome")})
 
 
 @pytest.fixture(autouse=True)
@@ -121,6 +142,122 @@ def test_torch_pin_present_and_never_unpinned_reinstall(tmp_path):
     assert "--index-url" in torch_cmds[0] and setup.TORCH_INDEX in torch_cmds[0]
     assert not any("--reinstall" in c and "torch" in c for c, _ in calls)
     assert setup.TORCH_PINS == ("torch==2.8.0+cu128", "torchaudio==2.8.0+cu128")
+    # the pins go in before the engine, so the engine install finds them and cannot swap them
+    order = [c for c, _ in calls if "pip" in c and "install" in c]
+    first_torch = next(i for i, c in enumerate(order) if "torch==2.8.0+cu128" in c)
+    engine = next(i for i, c in enumerate(order) if "-e" in c)
+    assert first_torch < engine
+
+
+def test_every_pip_install_carries_the_constraint_file(tmp_path):
+    calls = []
+    env = make_env(tmp_path, calls, [])
+    setup.run_setup(env)
+    pips = [c for c, _ in calls if "pip" in c and "install" in c]
+    assert len(pips) == 3
+    for c in pips:
+        i = c.index("-c")
+        assert c[i + 1] == str(env.constraints_file)
+        # only the torch install itself names the cu128 index (uv takes a package from the first index that has it)
+        assert (setup.TORCH_INDEX in c) == any(pin in c for pin in setup.TORCH_PINS)
+    assert env.constraints_file.read_text().split() == list(setup.TORCH_PINS)
+
+
+def test_torch_install_skipped_when_right_version_present(tmp_path):
+    calls, logs = [], []
+    env = make_env(tmp_path, calls, logs)
+    real = env.run
+
+    def run(cmd, e, cwd, on_line):
+        if "import torch;print(torch.__version__)" in [str(x) for x in cmd]:
+            calls.append(([str(x) for x in cmd], {}))
+            on_line("2.8.0+cu128")
+            return 0
+        return real(cmd, e, cwd, on_line)
+    env.run = run
+    setup.run_setup(env)
+    assert not any("torch==2.8.0+cu128" in c for c, _ in calls)
+    assert any("--upgrade" in c for c, _ in calls)           # the small packages are still checked
+    assert "Right version already installed, skipping" in [m for _, m in logs]
+
+
+def test_setup_state_is_verified_against_files(tmp_path):
+    env = make_env(tmp_path, [], [])
+    setup.run_setup(env)
+    assert setup.is_set_up(env.install)
+    assert not (env.install / "uv_cache").exists()
+    (env.install / "uv_cache").mkdir()
+    shutil_rmtree = __import__("shutil").rmtree
+    shutil_rmtree(env.model_dir)
+    assert not setup.is_set_up(env.install)
+    calls = []
+    env2 = make_env(tmp_path, calls, [])
+    ran = setup.run_setup(env2)
+    assert "model" in ran and "torch" not in ran and "uv" not in ran
+    # losing the venv re-runs what lives in it
+    shutil_rmtree(env2.venv)
+    assert not setup.is_set_up(env2.install)
+    ran = setup.run_setup(make_env(tmp_path, [], []))
+    assert {"python", "torch", "packages"} <= set(ran)
+    assert setup.is_set_up(env2.install)
+
+
+def test_model_download_skips_qwen_and_is_skipped_when_complete(tmp_path):
+    calls = []
+    env = make_env(tmp_path, calls, [])
+    setup.run_setup(env)
+    code = [c[-1] for c, _ in calls if "snapshot_download('IndexTeam" in c[-1]][0]
+    assert "ignore_patterns=['qwen*/*', 'qwen*']" in code
+    n = len(calls)
+    setup.step_model(env)
+    assert len(calls) == n
+
+
+def test_model_and_extras_reused_from_user_cache(tmp_path):
+    home = tmp_path / "nohome"
+    snap = home / ".cache" / "huggingface" / "hub" / "models--IndexTeam--IndexTTS-2" / "snapshots" / "s1"
+    for f in (*setup.MODEL_FILES, "qwen0.6bemo4-merge/model.safetensors"):
+        (snap / f).parent.mkdir(parents=True, exist_ok=True)
+        (snap / f).write_text("x")
+    user_hub = home / ".cache" / "huggingface" / "hub"
+    for repo, files in setup.EXTRAS_NEED.items():
+        for f in files:
+            (user_hub / repo / "snapshots" / "abc" / f).parent.mkdir(parents=True, exist_ok=True)
+            (user_hub / repo / "snapshots" / "abc" / f).write_text("x")
+    calls, logs = [], []
+    env = make_env(tmp_path, calls, logs)
+    setup.run_setup(env)
+    joined = [" ".join(c) for c, _ in calls]
+    assert not any("snapshot_download(" in j for j in joined) and not any("hf_hub_download(" in j for j in joined)
+    assert setup.model_complete(env.model_dir) and not (env.model_dir / "qwen0.6bemo4-merge").exists()
+    assert setup.extras_cached(env.install)
+    assert any("Found on this PC, copying" in m for _, m in logs)
+
+
+def test_incomplete_user_cache_is_not_reused(tmp_path):
+    hub = tmp_path / "nohome" / ".cache" / "huggingface" / "hub"
+    for repo, files in setup.EXTRAS_NEED.items():
+        for f in files:
+            (hub / repo / "snapshots" / "abc" / f).parent.mkdir(parents=True, exist_ok=True)
+            (hub / repo / "snapshots" / "abc" / f).write_text("x")
+    (hub / "models--funasr--campplus" / "blobs").mkdir(parents=True)
+    (hub / "models--funasr--campplus" / "blobs" / "dead.incomplete").write_text("x")
+    env = make_env(tmp_path, [], [])
+    setup.step_extras(env)                       # the fake run does the download for the one that was left out
+    assert not (env.install / "hf" / "hub" / "models--funasr--campplus" / "blobs" / "dead.incomplete").exists()
+    assert not setup._repo_complete(hub / "models--funasr--campplus", ["campplus_cn_common.bin"])
+
+
+def test_ssw_model_dir_env_is_used(tmp_path):
+    src = tmp_path / "mine"
+    src.mkdir()
+    for f in setup.MODEL_FILES:
+        (src / f).write_text("x")
+    calls = []
+    env = make_env(tmp_path, calls, [])
+    env.base_env["SSW_MODEL_DIR"] = str(src)
+    setup.step_model(env)
+    assert setup.model_complete(env.model_dir) and calls == []
 
 
 def test_key_only_in_child_env_not_argv_logs_or_files(tmp_path, caplog):
@@ -507,8 +644,9 @@ def test_enroll_second_uses_own_name_key_config_and_work_dir(tmp_path):
     assert names == ["LAPTOP-2"]
 
 
-def test_set_workers_gate_toggle_and_429_message(tmp_path):
+def test_set_workers_gate_toggle_and_429_message(tmp_path, monkeypatch):
     from speakstone_worker import cli, settings
+    monkeypatch.setattr(setup, "artifact_ok", lambda install, name: True)     # the state file alone is not enough now
     st = settings.Settings(tmp_path / "cli.json")
     assert st["workers"] == 1
     assert "12 GB" in cli.set_workers(None, tmp_path, st, gpu_reader=lambda: gpu_rd(8192))
@@ -904,3 +1042,119 @@ def test_remove_program_needs_the_word_delete(tmp_path):
     assert cli.remove_program(con, tmp_path, ask=lambda _p: "DELETE",
                               remover=lambda *a, **k: {"ok": True, "freed": 2e9, "left": ""}) is True
     assert "2.0 GB freed" in con.file.getvalue()
+
+
+# ------------------------------------------------------------------ stop kills the tree; background restarts
+def test_poll_stop_ends_the_whole_process_tree(tmp_path, monkeypatch):
+    from speakstone_worker import runner as rn
+    killed = []
+    monkeypatch.setattr(rn, "kill_pid_tree", lambda pid: killed.append(pid))
+
+    class P:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            killed.append("terminate")
+    now = [1.0]
+    r = rn.WorkerRunner(tmp_path, clock=lambda: now[0])
+    r.proc = P()
+    r.request_stop()
+    now[0] = 10
+    assert r.poll_stop(grace=120) is False and killed == []
+    now[0] = 500
+    assert r.poll_stop(grace=120) is False and killed == [4242]
+
+
+class FakeRunner:
+    def __init__(self):
+        self.running, self.exit_code, self.stop_asked_at, self.nice, self.starts = False, None, 0.0, False, 0
+
+    def start(self):
+        self.starts += 1
+        self.running, self.exit_code = True, None
+
+    def request_stop(self):
+        pass
+
+    def poll_stop(self, grace=120):
+        return not self.running
+
+    def shutdown_fast(self):
+        pass
+
+    def stop_and_wait(self):
+        pass
+
+
+def _tick(runner, gate):
+    from speakstone_worker import cli
+    from speakstone_worker.settings import Settings
+    st = {"idle_minutes": 1, "pause_from": "00:00", "pause_to": "00:00", "block_fullscreen": False,
+          "block_on_battery": False}
+    rd = {"idle_seconds": lambda: 9999, "fullscreen": lambda: False, "battery": lambda: False}
+    return cli.background_tick(runner, st, readers=rd, gate=gate)
+
+
+def test_refused_key_exit_is_not_restarted_for_half_an_hour():
+    from speakstone_worker import cli
+    clock = [1000.0]
+    gate, r = cli.RestartGate(clock=lambda: clock[0]), FakeRunner()
+    assert _tick(r, gate) == "start" and r.starts == 1
+    r.running, r.exit_code = False, 3                  # the worker quit: key refused
+    assert _tick(r, gate) == "wait" and r.starts == 1
+    clock[0] += 29 * 60
+    assert _tick(r, gate) == "wait" and r.starts == 1
+    clock[0] += 2 * 60
+    assert _tick(r, gate) == "start" and r.starts == 2
+
+
+def test_other_crashes_back_off_30_60_up_to_10_minutes():
+    from speakstone_worker import cli
+    clock = [0.0]
+    gate = cli.RestartGate(clock=lambda: clock[0])
+    waits = []
+    for _ in range(7):
+        gate.observe(True, None)
+        t0 = clock[0]
+        gate.observe(False, 1)
+        waits.append(gate.until - t0)
+    assert waits == [30, 60, 120, 240, 480, 600, 600]
+    gate.observe(True, None)
+    gate.observe(False, 0)                             # a clean exit resets it
+    assert gate.crashes == 0
+
+
+def test_stop_we_asked_for_is_not_a_crash():
+    from speakstone_worker import cli
+    gate = cli.RestartGate(clock=lambda: 0.0)
+    r = FakeRunner()
+    _tick(r, gate)
+    r.running, r.exit_code, r.stop_asked_at = False, 1, 5.0
+    _tick(r, gate)
+    assert not gate.blocked()
+
+
+def test_background_survives_a_failing_tick_and_logs_it(tmp_path, monkeypatch):
+    from speakstone_worker import cli
+    monkeypatch.setattr(cli, "hide_console", lambda: None)
+    monkeypatch.setattr(setup, "is_set_up", lambda i: True)
+    monkeypatch.setattr(setup, "extras_cached", lambda i: True)
+    monkeypatch.setattr(setup, "sync_worker_files", lambda *a: None)
+    monkeypatch.setattr(cli, "install_close_handlers", lambda f: None)
+    calls = []
+
+    def tick(runner, st, gate=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("odd")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "background_tick", tick)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    monkeypatch.setattr(cli, "WorkerGroup", lambda install, n: FakeRunner())
+    assert cli.background(tmp_path, {"workers": 1}) == 0
+    assert len(calls) == 2
+    assert "RuntimeError: odd" in (tmp_path / "work" / "logs" / "background.log").read_text()

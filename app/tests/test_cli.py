@@ -124,12 +124,12 @@ def test_make_enroller_sends_gpu_and_hostname():
         sent.update(json.loads(req.data))
         return Resp(json.dumps({"key": KEY}).encode())
 
-    go = enroll.make_enroller("https://x.test", lambda: ("RTX 3070 Ti", 8192), hostname=lambda: "DAN-PC")
+    go = enroll.make_enroller("https://x.test", lambda: ("RTX 3070 Ti", 8192), hostname=lambda: "PC-1")
     import urllib.request
     real = urllib.request.urlopen
     urllib.request.urlopen = opener
     try:
-        assert enroll.enroll("https://x.test", "DAN-PC", "RTX 3070 Ti", 8192, opener=opener) == KEY
+        assert enroll.enroll("https://x.test", "PC-1", "RTX 3070 Ti", 8192, opener=opener) == KEY
         assert sent["gpu"] == "RTX 3070 Ti"
     finally:
         urllib.request.urlopen = real

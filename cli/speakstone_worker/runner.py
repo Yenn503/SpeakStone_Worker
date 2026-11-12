@@ -287,10 +287,16 @@ class WorkerRunner:
         if not self.running:
             return True
         if self.stop_asked_at and self.clock() - self.stop_asked_at > grace:
-            try:
-                self.proc.terminate()
-            except OSError:
-                pass
+            # terminate() on Windows ends only the worker and can leave its engine child holding graphics memory,
+            # so end the whole tree. Fall back to terminate() when there is no pid to work with.
+            pid = getattr(self.proc, "pid", None)
+            if pid:
+                kill_pid_tree(pid)
+            else:
+                try:
+                    self.proc.terminate()
+                except OSError:
+                    pass
         return False
 
     def stop_and_wait(self, grace=120, sleep=time.sleep, on_wait=None):

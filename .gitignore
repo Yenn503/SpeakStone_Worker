@@ -5,3 +5,12 @@ work/
 jobs/
 refs/
 STOP
+worker_config*.json
+enrolled*.json
+*.log
+logs/
+*.pid
+.env
+dist*/
+build/
+.venv/
