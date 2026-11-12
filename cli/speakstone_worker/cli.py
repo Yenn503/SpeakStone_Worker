@@ -1,5 +1,6 @@
 """Menu, live board, settings and the hidden --background mode."""
 import argparse
+import ctypes
 import json
 import os
 import platform
@@ -80,7 +81,45 @@ def set_title(text, platform=None, kernel32=None, write=None):
         pass
 
 
+def attach_console(platform=None, stdout=None, opener=open, set_handle=None):
+    """Windows: when this program has a console window but its output goes nowhere, point output and input at the
+    window. Versions up to 1.2.4 restart the program after an update with its output thrown away, so the first start
+    of ANY newer version from one of those is an empty black window unless the new version repairs it itself.
+    -> True when it re-attached. Never raises."""
+    platform = platform or sys.platform
+    if platform != "win32":
+        return False
+    out = sys.stdout if stdout is None else stdout
+    try:
+        if out is not None and out.isatty():
+            return False
+    except Exception:
+        pass
+    try:
+        con_out = opener("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+        con_in = opener("CONIN$", "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return False                                  # no console at all (a pipe, a service): leave things as they are
+    sys.stdout = sys.stderr = con_out
+    sys.stdin = con_in
+    try:
+        if set_handle is None:
+            import msvcrt
+            k32 = ctypes.windll.kernel32
+            k32.SetStdHandle.argtypes = [ctypes.c_ulong, ctypes.c_void_p]
+
+            def set_handle(which, stream):
+                k32.SetStdHandle(which, msvcrt.get_osfhandle(stream.fileno()))
+        set_handle(0xFFFFFFF5, con_out)               # STD_OUTPUT_HANDLE (-11)
+        set_handle(0xFFFFFFF4, con_out)               # STD_ERROR_HANDLE (-12)
+        set_handle(0xFFFFFFF6, con_in)                # STD_INPUT_HANDLE (-10)
+    except Exception:
+        pass
+    return True
+
+
 def make_console():
+    attach_console()
     VT["on"] = enable_vt()                           # before the Console is made, so rich sees ANSI is available
     for stream in (sys.stdout, sys.stderr):          # piped/cp1252 consoles would choke on the block letters
         try:

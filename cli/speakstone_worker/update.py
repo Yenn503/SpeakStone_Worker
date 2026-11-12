@@ -291,11 +291,15 @@ def relaunch_command(exe, args, platform=None, environ=None):
 def _spawn_detached(cmd, popen=subprocess.Popen):
     env = dict(os.environ)
     env[RESET_ENV] = "1"
-    kw = dict(env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    kw = dict(env=env, **quiet)
     if sys.platform == "win32":
         base = 0x00000008 | 0x00000200                      # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
         if "--headless" not in cmd:
             base = 0x00000010 | 0x00000200                  # a menu run gets its own console window
+            # ... and must write to THAT window. Until 1.2.4 its output was sent nowhere, so after an update the
+            # restarted program was an empty black window (it was running, but drew to nothing).
+            kw = dict(env=env)
         try:                                                # leave the Task Scheduler's job, if it allows that
             return popen(cmd, creationflags=base | 0x01000000, **kw)
         except OSError:

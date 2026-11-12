@@ -1,4 +1,4 @@
-"""1.2.4: one worker per key on a PC, the app never starts a second, clearer event wording, the worker's own download
+"""1.2.5: one worker per key on a PC, the app never starts a second, clearer event wording, the worker's own download
 figure, and renaming the worker from Settings."""
 import io
 import json

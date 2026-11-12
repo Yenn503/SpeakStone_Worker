@@ -25,7 +25,7 @@ def release_json(tag="v1.3.0", names=("SpeakStoneWorker-windows.exe", "SpeakSton
 
 # ------------------------------------------------------------------ version and asset choice
 def test_version_is_shown_and_bumped():
-    assert __version__ == "1.2.4"
+    assert __version__ == "1.2.5"
     assert f"{APP_NAME} {__version__}" in board.menu_screen().plain
     assert cli.window_title() == f"{APP_NAME} {__version__}"
     assert "Update now" in board.menu_screen(False, "1.3.0").plain
@@ -1136,3 +1136,47 @@ def test_an_old_copy_still_running_does_not_block_the_next_swap_or_install(tmp_p
     assert exe.read_bytes() == b"downloaded" and (tmp_path / "SpeakStoneWorker.exe.old2").read_bytes() == b"newer"
     update.cleanup_old(exe)                             # nothing is running in the test: every old copy goes
     assert not list(tmp_path.glob("*.old*"))
+
+
+
+def test_a_restarted_menu_window_keeps_its_output(monkeypatch):
+    """After an update the menu window came back empty and black: its output had been sent nowhere (1.2.5)."""
+    import subprocess
+    monkeypatch.setattr(update.sys, "platform", "win32")
+    calls = []
+    update._spawn_detached(["C:/x/SpeakStoneWorker.exe", "--start"], popen=lambda cmd, **kw: calls.append(kw))
+    assert "stdout" not in calls[0] and "stdin" not in calls[0] and calls[0]["creationflags"] & 0x10
+    calls.clear()
+    update._spawn_detached(["conhost.exe", "--headless", "C:/x/SpeakStoneWorker.exe", "--background"],
+                           popen=lambda cmd, **kw: calls.append(kw))
+    assert calls[0]["stdout"] == subprocess.DEVNULL and calls[0]["creationflags"] & 0x08
+
+
+def test_attach_console_repairs_output_sent_nowhere(monkeypatch):
+    import io
+    from speakstone_worker import cli
+
+    class Dead(io.StringIO):
+        def isatty(self):
+            return False
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+    opened, handles = [], []
+
+    def opener(name, mode, **kw):
+        opened.append(name)
+        return io.StringIO()
+    old = (cli.sys.stdout, cli.sys.stderr, cli.sys.stdin)
+    try:
+        assert cli.attach_console("linux", Dead()) is False and opened == []
+        assert cli.attach_console("win32", Tty()) is False and opened == []          # a normal start: nothing to do
+        assert cli.attach_console("win32", Dead(), opener, lambda which, stream: handles.append(which)) is True
+        assert opened == ["CONOUT$", "CONIN$"] and len(handles) == 3
+
+        def no_console(name, mode, **kw):
+            raise OSError("no console")
+        assert cli.attach_console("win32", Dead(), no_console) is False
+    finally:
+        cli.sys.stdout, cli.sys.stderr, cli.sys.stdin = old
